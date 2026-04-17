@@ -536,10 +536,6 @@ def _append_ai_provider_checks(root: Path, lines: list[str]) -> int:
             if key and key.isupper():
                 declared.append(key)
         expected_provider_keys = [k for k in declared if k.endswith("_API_KEY")]
-        missing = [
-            k for k in expected_provider_keys
-            if not os.environ.get(k) and not any(k == env for env, _ in _HOSTED_PROVIDER_KEYS if os.environ.get(env))
-        ]
         all_missing = all(not os.environ.get(k) for k in expected_provider_keys)
         if expected_provider_keys and all_missing and not ollama_on_path:
             lines.append(
