@@ -418,6 +418,28 @@ class CliTests(unittest.TestCase):
         self.assertIn("unsafe local execution", output)
         run_command.assert_called_once_with(["sh", "-c", "echo hello"], cwd=root.resolve())
 
+    @patch("vex.cli.run_command", return_value=0)
+    def test_run_sandbox_preserves_single_quoted_shell_string(self, run_command: object) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                "unsafe_fallback = true\n"
+                'sandbox_backend = "none"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(["run", "--sandbox", "echo hi"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        run_command.assert_called_once_with(["sh", "-c", "echo hi"], cwd=root.resolve())
+
     def test_package_model_writes_manifest(self) -> None:
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:

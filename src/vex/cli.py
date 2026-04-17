@@ -889,6 +889,8 @@ def resolve_run_shell_command(args: argparse.Namespace, root: Path) -> str | Non
     scripts = load_vex_scripts(root)
     script = scripts.get(args.args[0])
     if script is None:
+        if len(args.args) == 1:
+            return args.args[0]
         return " ".join(shlex.quote(value) for value in args.args)
     extra = " ".join(shlex.quote(value) for value in args.args[1:])
     return script if not extra else f"{script} {extra}"
