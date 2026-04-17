@@ -986,6 +986,307 @@ class CliTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["exact_ok"], True)
         self.assertEqual(report["results"][1]["json_path_ok"], True)
 
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_detects_promptfoo_config(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            output_path = Path(argv[argv.index("--output") + 1])
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "results": {
+                            "results": [
+                                {
+                                    "success": True,
+                                    "prompt": {"raw": "hello"},
+                                    "response": {"output": "hi"},
+                                    "provider": {"id": "openai:gpt-4o-mini"},
+                                    "latencyMs": 123,
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "promptfooconfig.yaml").write_text("providers: []\n", encoding="utf-8")
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    ["eval", "--out", "artifacts/evals/promptfoo.json"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "promptfoo.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("adapter=promptfoo", output)
+        self.assertEqual(report["adapter"], "promptfoo")
+        self.assertEqual(subprocess_run.call_count, 1)
+        invoked_argv = subprocess_run.call_args.args[0]
+        self.assertEqual(invoked_argv[:4], ["/usr/local/bin/uvx", "promptfoo", "eval", "-c"])
+        self.assertIn("--output", invoked_argv)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture", return_value=(0, "out", ""))
+    def test_eval_no_promptfoo_flag_uses_harness(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "promptfooconfig.yaml").write_text("providers: []\n", encoding="utf-8")
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a"}\n', encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--no-promptfoo",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--out",
+                        "artifacts/evals/forced.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "forced.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("mode=per-case", output)
+        self.assertEqual(report["adapter"], "harness")
+        self.assertEqual(report["mode"], "per-case")
+        run_capture.assert_called_once()
+
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_normalizes_promptfoo_results(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        fake_payload = {
+            "results": {
+                "results": [
+                    {
+                        "success": True,
+                        "prompt": {"raw": "case-1"},
+                        "response": {"output": "ok"},
+                        "provider": "openai:gpt-4o-mini",
+                        "latencyMs": 42,
+                    },
+                    {
+                        "success": False,
+                        "prompt": {"raw": "case-2"},
+                        "response": {"output": "bad"},
+                        "provider": {"id": "openai:gpt-4o-mini"},
+                    },
+                    {
+                        "success": True,
+                        "vars": {"topic": "cats"},
+                        "output": "meow",
+                    },
+                ]
+            }
+        }
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            output_path = Path(argv[argv.index("--output") + 1])
+            output_path.write_text(json.dumps(fake_payload), encoding="utf-8")
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "promptfooconfig.yaml").write_text("providers: []\n", encoding="utf-8")
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["eval", "--out", "artifacts/evals/norm.json"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "norm.json").read_text(encoding="utf-8")
+            )
+
+        # 2/3 passed => overall harness would still flag failure (exit 1).
+        self.assertEqual(code, 1)
+        self.assertEqual(report["schema"], "vex-eval/v1")
+        self.assertEqual(report["adapter"], "promptfoo")
+        self.assertEqual(report["passed"], 2)
+        self.assertEqual(report["failed"], 1)
+        self.assertAlmostEqual(report["pass_rate"], 66.67, places=2)
+        self.assertEqual(len(report["results"]), 3)
+        self.assertEqual(report["results"][0]["input"], "case-1")
+        self.assertEqual(report["results"][0]["output"], "ok")
+        self.assertEqual(report["results"][0]["provider"], "openai:gpt-4o-mini")
+        self.assertEqual(report["results"][0]["latency_ms"], 42.0)
+        self.assertEqual(report["results"][0]["passed"], True)
+        self.assertEqual(report["results"][1]["passed"], False)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture")
+    def test_eval_min_pass_rate_gates(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        run_capture.side_effect = [
+            (0, "hit", ""),
+            (1, "miss", ""),
+            (1, "miss", ""),
+        ]
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a","expect_contains":"hit"}\n'
+                '{"input":"b","expect_contains":"hit"}\n'
+                '{"input":"c","expect_contains":"hit"}\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--min-pass-rate",
+                        "0.5",
+                        "--out",
+                        "artifacts/evals/gate.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "gate.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(report["passed"], 1)
+        self.assertEqual(report["failed"], 2)
+        self.assertIn("below --min-pass-rate", output)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture")
+    def test_eval_min_pass_rate_passes_when_above_threshold(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        run_capture.side_effect = [
+            (0, "hit", ""),
+            (0, "hit", ""),
+            (1, "miss", ""),
+        ]
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a","expect_contains":"hit"}\n'
+                '{"input":"b","expect_contains":"hit"}\n'
+                '{"input":"c","expect_contains":"hit"}\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--min-pass-rate",
+                        "0.5",
+                        "--out",
+                        "artifacts/evals/gate-pass.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        # 2/3 = 66% which is above the 50% gate, but one case hard-failed
+        # so the raw harness still exits 1. The gate itself does not fire.
+        self.assertEqual(code, 1)
+        self.assertNotIn("below --min-pass-rate", output)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture", return_value=(0, "hit", ""))
+    def test_eval_json_flag_prints_report_to_stdout(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a","expect_contains":"hit"}\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--json",
+                        "--out",
+                        "artifacts/evals/json.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        # Must be a single JSON document — parseable without tweaks.
+        payload = json.loads(output.strip())
+        self.assertEqual(payload["schema"], "vex-eval/v1")
+        self.assertEqual(payload["adapter"], "harness")
+        self.assertEqual(payload["mode"], "per-case")
+        self.assertEqual(payload["passed"], 1)
+        # Human-friendly summary suppressed when --json is set.
+        self.assertNotIn("Eval report written", output)
+
     @patch("vex.cli.docker_like_bin", return_value="docker")
     @patch("vex.cli.run_command", return_value=0)
     def test_deploy_docker_builds_image(self, run_command: object, _docker: object) -> None:
@@ -1100,36 +1401,253 @@ class CliTests(unittest.TestCase):
         self.assertIn("WARN docker/podman not found", output)
         self.assertIn("WARN gcloud CLI not found", output)
 
+    @patch("vex.cli.run_command_capture", return_value=(0, "https://svc-abcd-uw.a.run.app\n", ""))
     @patch("vex.cli.run_command", return_value=0)
+    @patch("vex.cli.detect_gcloud_project", return_value="demo-project")
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
     @patch("vex.cli.shutil.which", return_value="/usr/bin/gcloud")
-    def test_deploy_cloud_run_apply_invokes_gcloud(self, _which: object, run_command: object) -> None:
+    def test_deploy_cloud_run_apply_calls_gcloud_deploy(
+        self,
+        _which: object,
+        _uv_bin: object,
+        _docker: object,
+        _project: object,
+        run_command: object,
+        _run_capture: object,
+    ) -> None:
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             os.chdir(temp_dir)
             try:
-                code, _output = self.run_cli(["deploy", "cloud-run", "--apply", "--service", "svc", "--region", "us-west1"])
+                code, _output = self.run_cli(
+                    [
+                        "deploy",
+                        "cloud-run",
+                        "--apply",
+                        "--service",
+                        "svc",
+                        "--region",
+                        "us-west1",
+                        "--project",
+                        "demo-project",
+                        "--image",
+                        "gcr.io/demo-project/svc",
+                        "--tag",
+                        "v1",
+                    ]
+                )
             finally:
                 os.chdir(original_cwd)
 
         self.assertEqual(code, 0)
-        called_argv = run_command.call_args.args[0]
-        self.assertEqual(called_argv[0:4], ["gcloud", "run", "services", "replace"])
+        build_argv = run_command.call_args.args[0]
+        self.assertEqual(build_argv[0:3], ["gcloud", "builds", "submit"])
+        self.assertIn("gcr.io/demo-project/svc:v1", build_argv)
 
+        deploy_argv = _run_capture.call_args.args[0]
+        self.assertEqual(deploy_argv[0:4], ["gcloud", "run", "deploy", "svc"])
+        self.assertIn("--image", deploy_argv)
+        self.assertIn("gcr.io/demo-project/svc:v1", deploy_argv)
+        self.assertIn("--region", deploy_argv)
+        self.assertIn("us-west1", deploy_argv)
+        self.assertIn("--project", deploy_argv)
+        self.assertIn("demo-project", deploy_argv)
+
+    @patch("vex.cli.run_command_capture", return_value=(0, "https://svc.a.run.app\n", ""))
     @patch("vex.cli.run_command", return_value=0)
+    @patch("vex.cli.detect_gcloud_project", return_value="demo-project")
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    @patch("vex.cli.shutil.which", return_value="/usr/bin/gcloud")
+    def test_deploy_cloud_run_apply_respects_profile_interpolation(
+        self,
+        _which: object,
+        _uv_bin: object,
+        _docker: object,
+        _project: object,
+        run_command: object,
+        run_capture: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        previous_repo = os.environ.get("VEX_IMAGE_REPO")
+        os.environ["VEX_IMAGE_REPO"] = "gcr.io/demo"
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / "deploy.targets.toml").write_text(
+                    "[profiles.default]\n"
+                    'image = "${VEX_IMAGE_REPO}/app"\n'
+                    'tag = "v7"\n'
+                    'service = "my-svc"\n'
+                    'region = "us-west1"\n'
+                    'project = "demo-project"\n'
+                    'memory = "1Gi"\n'
+                    'cpu = "2"\n'
+                    'min_instances = 1\n'
+                    'max_instances = 4\n'
+                    'service_account = "runner@demo-project.iam.gserviceaccount.com"\n',
+                    encoding="utf-8",
+                )
+                os.chdir(temp_dir)
+                try:
+                    code, _output = self.run_cli(["deploy", "cloud-run", "--apply"])
+                finally:
+                    os.chdir(original_cwd)
+        finally:
+            if previous_repo is None:
+                os.environ.pop("VEX_IMAGE_REPO", None)
+            else:
+                os.environ["VEX_IMAGE_REPO"] = previous_repo
+
+        self.assertEqual(code, 0)
+        build_argv = run_command.call_args.args[0]
+        self.assertIn("gcr.io/demo/app:v7", build_argv)
+
+        deploy_argv = run_capture.call_args.args[0]
+        self.assertIn("gcr.io/demo/app:v7", deploy_argv)
+        self.assertIn("--memory", deploy_argv)
+        self.assertIn("1Gi", deploy_argv)
+        self.assertIn("--cpu", deploy_argv)
+        self.assertIn("2", deploy_argv)
+        self.assertIn("--min-instances", deploy_argv)
+        self.assertIn("1", deploy_argv)
+        self.assertIn("--max-instances", deploy_argv)
+        self.assertIn("4", deploy_argv)
+        self.assertIn("--service-account", deploy_argv)
+        self.assertIn("runner@demo-project.iam.gserviceaccount.com", deploy_argv)
+
+    @patch("vex.cli.run_command_capture")
+    @patch("vex.cli.run_command")
+    @patch("vex.cli.deploy_preflight", return_value=(2, ["WARN missing tool"]))
+    def test_deploy_cloud_run_apply_runs_preflight_first(
+        self,
+        _preflight: object,
+        run_command: object,
+        run_capture: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    ["deploy", "cloud-run", "--apply", "--service", "svc", "--project", "p"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("WARN missing tool", output)
+        run_command.assert_not_called()
+        run_capture.assert_not_called()
+
+    @patch(
+        "vex.cli.run_command_capture",
+        return_value=(
+            0,
+            "Building...\n✓ Created web endpoint => https://acme--demo-app.modal.run\n",
+            "",
+        ),
+    )
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
     @patch("vex.cli.shutil.which")
-    def test_deploy_modal_run_invokes_modal_cli(self, which_mock: object, run_command: object) -> None:
+    def test_deploy_modal_run_invokes_modal_cli(
+        self,
+        which_mock: object,
+        _uv_bin: object,
+        _docker: object,
+        run_capture: object,
+    ) -> None:
         which_mock.side_effect = lambda name: "/usr/bin/modal" if name == "modal" else None
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             os.chdir(temp_dir)
             try:
-                code, _output = self.run_cli(["deploy", "modal", "--run", "--app-name", "demo-app"])
+                code, _output = self.run_cli(
+                    [
+                        "deploy",
+                        "modal",
+                        "--run",
+                        "--app-name",
+                        "demo-app",
+                        "--skip-preflight",
+                    ]
+                )
             finally:
                 os.chdir(original_cwd)
 
         self.assertEqual(code, 0)
-        called_argv = run_command.call_args.args[0]
+        called_argv = run_capture.call_args.args[0]
         self.assertEqual(called_argv[0:2], ["modal", "deploy"])
+        # Scaffold path should be passed as third arg.
+        self.assertTrue(called_argv[2].endswith("modal_app.py"))
+
+    @patch(
+        "vex.cli.run_command_capture",
+        return_value=(
+            0,
+            "View app at https://acme--demo-app.modal.run\n",
+            "",
+        ),
+    )
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    @patch("vex.cli.shutil.which")
+    def test_deploy_modal_run_surfaces_deployed_url(
+        self,
+        which_mock: object,
+        _uv_bin: object,
+        _docker: object,
+        _run_capture: object,
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/bin/modal" if name == "modal" else None
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "deploy",
+                        "modal",
+                        "--run",
+                        "--app-name",
+                        "demo-app",
+                        "--skip-preflight",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Deployed: https://acme--demo-app.modal.run", output)
+
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_deploy_docker_run_builds_and_runs_image(
+        self, run_command: object, _docker: object
+    ) -> None:
+        code, _output = self.run_cli(
+            [
+                "deploy",
+                "docker",
+                "--image",
+                "ghcr.io/acme/app",
+                "--tag",
+                "v1",
+                "--run",
+                "--port",
+                "8080",
+                "--skip-preflight",
+            ]
+        )
+        self.assertEqual(code, 0)
+        argvs = [call.args[0] for call in run_command.call_args_list]
+        self.assertEqual(argvs[0], ["docker", "build", "-t", "ghcr.io/acme/app:v1", "."])
+        self.assertEqual(
+            argvs[-1],
+            ["docker", "run", "--rm", "-p", "8080:8080", "ghcr.io/acme/app:v1"],
+        )
 
 
 if __name__ == "__main__":

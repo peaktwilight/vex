@@ -10,6 +10,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -249,6 +250,22 @@ def load_vex_scripts(root: Path) -> dict[str, str]:
     if not isinstance(scripts, dict):
         return {}
     return {str(key): str(value) for key, value in scripts.items()}
+
+
+def load_vex_eval_config(root: Path) -> dict[str, Any]:
+    data = load_pyproject(root)
+    config = data.get("tool", {}).get("vex", {}).get("eval", {})
+    if not isinstance(config, dict):
+        return {}
+    return {str(key): value for key, value in config.items()}
+
+
+def detect_promptfoo_config(root: Path) -> Path | None:
+    for candidate in ("promptfooconfig.yaml", "promptfooconfig.yml"):
+        path = root / candidate
+        if path.exists() and path.is_file():
+            return path
+    return None
 
 
 def load_vex_policy(root: Path) -> dict[str, object]:
@@ -1333,7 +1350,259 @@ def run_benchmark_harness(root: Path, command: str, runs: int, warmup: int, out_
     return 0 if all(code == 0 for code in exit_codes) else 1
 
 
-def run_eval_harness(root: Path, command: str, dataset_path: Path, out_path: Path) -> int:
+def _emit_eval_report(report: dict[str, Any], out_path: Path, emit_json: bool) -> None:
+    """Write report to file and either print JSON or a human summary."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if emit_json:
+        print(json.dumps(report))
+
+
+def _apply_min_pass_rate(report: dict[str, Any], threshold: float | None, exit_code: int) -> int:
+    """Return updated exit code after applying the min pass-rate gate.
+
+    Threshold is a fraction 0.0-1.0; compared against ``pass_rate`` stored as a
+    percent (0-100) inside the report, consistent with the existing per-case
+    schema.
+    """
+    if threshold is None:
+        return exit_code
+    pass_rate_percent = report.get("pass_rate", 0.0)
+    if not isinstance(pass_rate_percent, (int, float)):
+        pass_rate_percent = 0.0
+    target_percent = threshold * 100
+    if pass_rate_percent < target_percent:
+        print(
+            f"FAIL pass_rate={pass_rate_percent}% below --min-pass-rate "
+            f"{target_percent}% gate"
+        )
+        return 1 if exit_code == 0 else exit_code
+    return exit_code
+
+
+def _promptfoo_binary() -> tuple[list[str], str] | None:
+    """Resolve a command list capable of invoking promptfoo.
+
+    Prefers ``uvx`` (already required as part of the ``uv`` toolchain) and
+    falls back to a system ``promptfoo`` on PATH.
+    """
+    uvx = shutil.which("uvx")
+    if uvx:
+        return [uvx, "promptfoo"], "uvx"
+    promptfoo = shutil.which("promptfoo")
+    if promptfoo:
+        return [promptfoo], "promptfoo"
+    return None
+
+
+def normalize_promptfoo_report(
+    raw: dict[str, Any],
+    *,
+    command: str | None,
+    dataset_path: Path,
+    config_path: Path,
+) -> dict[str, Any]:
+    """Map a promptfoo JSON output to the vex-eval/v1 schema.
+
+    promptfoo's schema varies across versions; we look at ``results`` and
+    ``results.results`` (v0.x nests results under a top-level key) and fall
+    back to sensible defaults when keys are missing.
+    """
+    payload: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    nested = payload.get("results")
+    if isinstance(nested, dict):
+        payload = nested
+
+    raw_cases: Any = payload.get("results")
+    if not isinstance(raw_cases, list):
+        raw_cases = []
+
+    normalized_cases: list[dict[str, Any]] = []
+    passed = 0
+    for index, case in enumerate(raw_cases, start=1):
+        if not isinstance(case, dict):
+            continue
+        success = bool(case.get("success", case.get("pass", False)))
+        if success:
+            passed += 1
+
+        prompt = case.get("prompt") or {}
+        if isinstance(prompt, dict):
+            input_text = str(prompt.get("raw") or prompt.get("display") or "")
+        else:
+            input_text = str(prompt or "")
+        vars_value = case.get("vars")
+        if not input_text and isinstance(vars_value, dict):
+            input_text = json.dumps(vars_value, sort_keys=True)
+
+        response = case.get("response") or {}
+        output_text = ""
+        if isinstance(response, dict):
+            output_text = str(response.get("output", ""))
+        if not output_text and "output" in case:
+            output_text = str(case.get("output", ""))
+
+        provider: Any = case.get("provider")
+        if isinstance(provider, dict):
+            provider_id = str(provider.get("id") or provider.get("label") or "")
+        elif isinstance(provider, str):
+            provider_id = provider
+        else:
+            provider_id = ""
+
+        latency_ms: float | None = None
+        for key in ("latencyMs", "latency_ms", "tokensPerSecond"):
+            raw_latency = case.get(key)
+            if isinstance(raw_latency, (int, float)):
+                latency_ms = float(raw_latency)
+                break
+
+        score = case.get("score")
+        normalized_cases.append(
+            {
+                "index": index,
+                "input": input_text,
+                "output": output_text,
+                "passed": success,
+                "provider": provider_id,
+                "latency_ms": latency_ms,
+                "score": score if isinstance(score, (int, float)) else None,
+            }
+        )
+
+    failed = len(normalized_cases) - passed
+    pass_rate = round((passed / len(normalized_cases)) * 100, 2) if normalized_cases else 0.0
+
+    return {
+        "schema": "vex-eval/v1",
+        "adapter": "promptfoo",
+        "mode": "promptfoo",
+        "command": command,
+        "config": str(config_path),
+        "dataset": str(dataset_path),
+        "dataset_case_count": len(normalized_cases),
+        "passed": passed,
+        "failed": failed,
+        "pass_rate": pass_rate,
+        "results": normalized_cases,
+    }
+
+
+def run_eval_promptfoo_adapter(
+    root: Path,
+    config_path: Path,
+    dataset_path: Path,
+    out_path: Path,
+    *,
+    timeout: float,
+    emit_json: bool,
+    min_pass_rate: float | None,
+) -> int:
+    """Delegate to a locally discovered ``promptfoo`` binary."""
+    binary = _promptfoo_binary()
+    if binary is None:
+        print(
+            "vex eval promptfoo adapter requires 'uvx' or 'promptfoo' on PATH. "
+            "Install uv (https://docs.astral.sh/uv/) or pass --no-promptfoo to "
+            "use the Python harness."
+        )
+        return 127
+    command_list, runner_name = binary
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".json", prefix="vex-promptfoo-", delete=False
+    ) as tmp_file:
+        tmp_output = Path(tmp_file.name)
+
+    try:
+        argv = [
+            *command_list,
+            "eval",
+            "-c",
+            str(config_path),
+            "--output",
+            str(tmp_output),
+        ]
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"promptfoo adapter timed out after {timeout}s "
+                f"(runner={runner_name}). Increase --timeout if needed."
+            )
+            return 124
+        except FileNotFoundError:
+            print(f"promptfoo adapter failed: {runner_name} not found")
+            return 127
+
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+
+        raw_report: dict[str, Any] = {}
+        if tmp_output.exists():
+            raw_text = tmp_output.read_text(encoding="utf-8")
+            if raw_text.strip():
+                try:
+                    parsed = json.loads(raw_text)
+                    if isinstance(parsed, dict):
+                        raw_report = parsed
+                except json.JSONDecodeError:
+                    raw_report = {}
+    finally:
+        try:
+            tmp_output.unlink()
+        except OSError:
+            pass
+
+    if completed.returncode != 0 and not raw_report:
+        # Surface subprocess output clearly so CI logs are actionable.
+        if stdout.strip():
+            print(stdout.rstrip())
+        if stderr.strip():
+            print(stderr.rstrip(), file=sys.stderr)
+        print(
+            f"promptfoo exited with code {completed.returncode} "
+            f"(runner={runner_name})"
+        )
+        return completed.returncode if completed.returncode != 0 else 1
+
+    report = normalize_promptfoo_report(
+        raw_report,
+        command=f"{runner_name} promptfoo",
+        dataset_path=dataset_path,
+        config_path=config_path,
+    )
+
+    _emit_eval_report(report, out_path, emit_json)
+    if not emit_json:
+        print(f"Eval report written to {out_path}")
+        print(
+            f"adapter=promptfoo passed={report['passed']} failed={report['failed']} "
+            f"pass_rate={report['pass_rate']}%"
+        )
+
+    exit_code = completed.returncode
+    if exit_code == 0 and report["failed"] > 0:
+        exit_code = 1
+    return _apply_min_pass_rate(report, min_pass_rate, exit_code)
+
+
+def run_eval_harness(
+    root: Path,
+    command: str,
+    dataset_path: Path,
+    out_path: Path,
+    *,
+    emit_json: bool = False,
+    min_pass_rate: float | None = None,
+) -> int:
     uv = uv_bin()
     if uv is None:
         print("vex eval requires 'uv' on PATH")
@@ -1350,6 +1619,7 @@ def run_eval_harness(root: Path, command: str, dataset_path: Path, out_path: Pat
 
     report = {
         "schema": "vex-eval/v1",
+        "adapter": "harness",
         "command": command,
         "dataset": str(dataset_path),
         "dataset_exists": dataset_exists,
@@ -1357,13 +1627,18 @@ def run_eval_harness(root: Path, command: str, dataset_path: Path, out_path: Pat
         "exit_code": code,
         "duration_ms": elapsed_ms,
         "status": "passed" if code == 0 else "failed",
+        "passed": case_count if code == 0 else 0,
+        "failed": 0 if code == 0 else case_count,
+        "pass_rate": 100.0 if code == 0 else 0.0,
+        "results": [],
     }
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"Eval report written to {out_path}")
-    print(f"status={report['status']} duration={elapsed_ms}ms cases={case_count}")
-    return 0 if code == 0 else 1
+    _emit_eval_report(report, out_path, emit_json)
+    if not emit_json:
+        print(f"Eval report written to {out_path}")
+        print(f"status={report['status']} duration={elapsed_ms}ms cases={case_count}")
+    exit_code = 0 if code == 0 else 1
+    return _apply_min_pass_rate(report, min_pass_rate, exit_code)
 
 
 def load_eval_cases(dataset_path: Path) -> list[dict[str, Any]]:
@@ -1382,7 +1657,15 @@ def load_eval_cases(dataset_path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def run_eval_per_case_harness(root: Path, command: str, dataset_path: Path, out_path: Path) -> int:
+def run_eval_per_case_harness(
+    root: Path,
+    command: str,
+    dataset_path: Path,
+    out_path: Path,
+    *,
+    emit_json: bool = False,
+    min_pass_rate: float | None = None,
+) -> int:
     uv = uv_bin()
     if uv is None:
         print("vex eval requires 'uv' on PATH")
@@ -1459,6 +1742,7 @@ def run_eval_per_case_harness(root: Path, command: str, dataset_path: Path, out_
 
     report = {
         "schema": "vex-eval/v1",
+        "adapter": "harness",
         "mode": "per-case",
         "command": command,
         "dataset": str(dataset_path),
@@ -1469,18 +1753,29 @@ def run_eval_per_case_harness(root: Path, command: str, dataset_path: Path, out_
         "results": results,
     }
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"Eval report written to {out_path}")
-    print(f"mode=per-case passed={report['passed']} failed={report['failed']} pass_rate={report['pass_rate']}%")
-    return 0 if report["failed"] == 0 else 1
+    _emit_eval_report(report, out_path, emit_json)
+    if not emit_json:
+        print(f"Eval report written to {out_path}")
+        print(
+            f"mode=per-case passed={report['passed']} failed={report['failed']} "
+            f"pass_rate={report['pass_rate']}%"
+        )
+    exit_code = 0 if report["failed"] == 0 else 1
+    return _apply_min_pass_rate(report, min_pass_rate, exit_code)
 
 
 def docker_like_bin() -> str | None:
     return shutil.which("docker") or shutil.which("podman")
 
 
-def deploy_docker(root: Path, image: str, tag: str, push: bool) -> int:
+def deploy_docker(
+    root: Path,
+    image: str,
+    tag: str,
+    push: bool,
+    run_container: bool = False,
+    port: int | None = None,
+) -> int:
     tool = docker_like_bin()
     if tool is None:
         print("No docker-compatible CLI found (docker or podman)")
@@ -1492,8 +1787,179 @@ def deploy_docker(root: Path, image: str, tag: str, push: bool) -> int:
         return build_code
 
     if push:
-        return run_command([tool, "push", full_image], cwd=root)
+        push_code = run_command([tool, "push", full_image], cwd=root)
+        if push_code != 0:
+            return push_code
+        print(f"Pushed image {full_image}")
+
+    if run_container:
+        mapped_port = port if port is not None else 8000
+        port_mapping = f"{mapped_port}:{mapped_port}"
+        run_code = run_command(
+            [tool, "run", "--rm", "-p", port_mapping, full_image],
+            cwd=root,
+        )
+        if run_code != 0:
+            return run_code
+        print(f"Ran image {full_image} on port {mapped_port}")
+        return 0
+
     print(f"Built image {full_image}")
+    return 0
+
+
+def _stringify(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def profile_value(
+    profile: dict[str, Any],
+    *keys: str,
+    default: Any = None,
+) -> Any:
+    """Return the first matching key from the profile, supporting aliases."""
+    for key in keys:
+        if key in profile:
+            return profile[key]
+    return default
+
+
+def parse_modal_url(output: str) -> str | None:
+    """Extract a deployed URL from modal CLI output.
+
+    Modal prints lines like ``View app at https://example--demo-app.modal.run``
+    or ``✓ Created web endpoint => https://...modal.run``.
+    """
+    if not output:
+        return None
+    pattern = re.compile(r"https?://[^\s'\"<>]+\.modal\.run[^\s'\"<>]*")
+    match = pattern.search(output)
+    if match:
+        return match.group(0).rstrip(".,)")
+    return None
+
+
+def parse_cloud_run_url(output: str) -> str | None:
+    """Extract a deployed service URL from gcloud run deploy output."""
+    if not output:
+        return None
+    pattern = re.compile(r"https?://[A-Za-z0-9.\-]+\.run\.app[^\s'\"<>]*")
+    match = pattern.search(output)
+    if match:
+        return match.group(0).rstrip(".,)")
+    return None
+
+
+def deploy_modal(root: Path, scaffold_path: Path) -> int:
+    if shutil.which("modal") is None:
+        print("modal CLI not found", file=sys.stderr)
+        return 127
+    code, stdout, stderr = run_command_capture(
+        ["modal", "deploy", str(scaffold_path)],
+        cwd=root,
+    )
+    if stdout:
+        sys.stdout.write(stdout)
+        if not stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(stderr)
+        if not stderr.endswith("\n"):
+            sys.stderr.write("\n")
+    if code != 0:
+        print(f"modal deploy failed with exit code {code}", file=sys.stderr)
+        return code
+    combined = (stdout or "") + "\n" + (stderr or "")
+    url = parse_modal_url(combined)
+    if url:
+        print(f"Deployed: {url}")
+    else:
+        print("Deployed (no URL detected in modal output)")
+    return 0
+
+
+def deploy_cloud_run(
+    root: Path,
+    service: str,
+    region: str,
+    image: str,
+    tag: str,
+    project: str | None,
+    profile: dict[str, Any],
+) -> int:
+    if shutil.which("gcloud") is None:
+        print("gcloud CLI not found", file=sys.stderr)
+        return 127
+
+    full_image = f"{image}:{tag}"
+
+    build_argv = ["gcloud", "builds", "submit", "--tag", full_image]
+    if project:
+        build_argv.extend(["--project", project])
+    build_code = run_command(build_argv, cwd=root)
+    if build_code != 0:
+        print(f"gcloud builds submit failed with exit code {build_code}", file=sys.stderr)
+        return build_code
+
+    deploy_argv: list[str] = [
+        "gcloud",
+        "run",
+        "deploy",
+        service,
+        "--image",
+        full_image,
+        "--region",
+        region,
+        "--format",
+        "value(status.url)",
+        "--quiet",
+    ]
+    if project:
+        deploy_argv.extend(["--project", project])
+
+    memory = _stringify(profile_value(profile, "memory"))
+    if memory:
+        deploy_argv.extend(["--memory", memory])
+    cpu = _stringify(profile_value(profile, "cpu"))
+    if cpu:
+        deploy_argv.extend(["--cpu", cpu])
+    min_instances = _stringify(profile_value(profile, "min_instances", "min-instances"))
+    if min_instances:
+        deploy_argv.extend(["--min-instances", min_instances])
+    max_instances = _stringify(profile_value(profile, "max_instances", "max-instances"))
+    if max_instances:
+        deploy_argv.extend(["--max-instances", max_instances])
+    service_account = _stringify(
+        profile_value(profile, "service_account", "service-account")
+    )
+    if service_account:
+        deploy_argv.extend(["--service-account", service_account])
+    allow_unauthenticated = profile_value(profile, "allow_unauthenticated", "allow-unauthenticated")
+    if isinstance(allow_unauthenticated, bool):
+        deploy_argv.append("--allow-unauthenticated" if allow_unauthenticated else "--no-allow-unauthenticated")
+
+    code, stdout, stderr = run_command_capture(deploy_argv, cwd=root)
+    if stdout:
+        sys.stdout.write(stdout)
+        if not stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(stderr)
+        if not stderr.endswith("\n"):
+            sys.stderr.write("\n")
+    if code != 0:
+        print(f"gcloud run deploy failed with exit code {code}", file=sys.stderr)
+        return code
+
+    url = parse_cloud_run_url((stdout or "") + "\n" + (stderr or ""))
+    if url:
+        print(f"Deployed: {url}")
+    else:
+        print(f"Deployed service {service} (no URL detected in gcloud output)")
     return 0
 
 
@@ -1726,6 +2192,31 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--dataset", default="evals/datasets/cases.jsonl")
     eval_parser.add_argument("--out", default="artifacts/evals/latest.json")
     eval_parser.add_argument("--per-case", action="store_true")
+    eval_parser.add_argument(
+        "--json",
+        dest="emit_json",
+        action="store_true",
+        help="Print the normalized report JSON to stdout (suppresses the human summary).",
+    )
+    eval_parser.add_argument(
+        "--min-pass-rate",
+        dest="min_pass_rate",
+        type=float,
+        default=None,
+        help="Fail the run when pass_rate falls below this fraction (0.0-1.0).",
+    )
+    eval_parser.add_argument(
+        "--no-promptfoo",
+        dest="no_promptfoo",
+        action="store_true",
+        help="Force the built-in Python harness even if promptfooconfig.yaml exists.",
+    )
+    eval_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Timeout (seconds) for the promptfoo subprocess (default: 300).",
+    )
     eval_parser.add_argument("args", nargs=argparse.REMAINDER)
     eval_parser.set_defaults(handler=handle_eval)
 
@@ -1736,10 +2227,13 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--push", action="store_true")
     deploy_parser.add_argument("--service", default="vex-ai-service")
     deploy_parser.add_argument("--region", default="us-central1")
+    deploy_parser.add_argument("--project", default=None)
     deploy_parser.add_argument("--app-name", default="vex-ai-app")
     deploy_parser.add_argument("--apply", action="store_true")
     deploy_parser.add_argument("--run", action="store_true")
+    deploy_parser.add_argument("--port", type=int, default=None)
     deploy_parser.add_argument("--profile", default="default")
+    deploy_parser.add_argument("--skip-preflight", action="store_true")
     deploy_parser.add_argument("--for", dest="check_target", choices=["all", "docker", "cloud-run", "modal"], default="all")
     deploy_parser.set_defaults(handler=handle_deploy)
 
@@ -2094,6 +2588,62 @@ def handle_benchmark(args: argparse.Namespace) -> int:
 
 def handle_eval(args: argparse.Namespace) -> int:
     root = project_root()
+    eval_config = load_vex_eval_config(root)
+
+    # --min-pass-rate: CLI flag wins, pyproject is the fallback default.
+    min_pass_rate: float | None = args.min_pass_rate
+    if min_pass_rate is None:
+        configured = eval_config.get("min_pass_rate")
+        if isinstance(configured, (int, float)):
+            min_pass_rate = float(configured)
+    if min_pass_rate is not None:
+        if min_pass_rate < 0.0 or min_pass_rate > 1.0:
+            print(
+                "--min-pass-rate must be a fraction between 0.0 and 1.0 "
+                f"(got {min_pass_rate})"
+            )
+            return 2
+
+    # Adapter selection precedence:
+    # 1. explicit --command -> always use harness
+    # 2. --no-promptfoo CLI flag -> always use harness
+    # 3. [tool.vex.eval].adapter = "harness" | "promptfoo" | "auto"
+    # 4. "auto": delegate when promptfooconfig.yaml is present
+    adapter_setting = str(eval_config.get("adapter", "auto")).lower()
+    if adapter_setting not in {"auto", "promptfoo", "harness"}:
+        adapter_setting = "auto"
+
+    explicit_command = args.command is not None
+    use_promptfoo = False
+    config_path: Path | None = None
+
+    if not explicit_command and not args.no_promptfoo:
+        if adapter_setting == "promptfoo":
+            config_path = detect_promptfoo_config(root)
+            if config_path is None:
+                print(
+                    "vex eval adapter='promptfoo' but no promptfooconfig.yaml "
+                    "was found at the project root"
+                )
+                return 2
+            use_promptfoo = True
+        elif adapter_setting == "auto":
+            config_path = detect_promptfoo_config(root)
+            use_promptfoo = config_path is not None
+
+    if use_promptfoo and config_path is not None:
+        dataset_path = root / args.dataset
+        out_path = root / args.out
+        return run_eval_promptfoo_adapter(
+            root,
+            config_path=config_path,
+            dataset_path=dataset_path,
+            out_path=out_path,
+            timeout=max(1.0, float(args.timeout)),
+            emit_json=bool(args.emit_json),
+            min_pass_rate=min_pass_rate,
+        )
+
     command = args.command
     if command is None:
         command = resolve_optional_script_command("eval", root)
@@ -2107,8 +2657,22 @@ def handle_eval(args: argparse.Namespace) -> int:
     dataset_path = root / args.dataset
     out_path = root / args.out
     if args.per_case:
-        return run_eval_per_case_harness(root, command, dataset_path=dataset_path, out_path=out_path)
-    return run_eval_harness(root, command, dataset_path=dataset_path, out_path=out_path)
+        return run_eval_per_case_harness(
+            root,
+            command,
+            dataset_path=dataset_path,
+            out_path=out_path,
+            emit_json=bool(args.emit_json),
+            min_pass_rate=min_pass_rate,
+        )
+    return run_eval_harness(
+        root,
+        command,
+        dataset_path=dataset_path,
+        out_path=out_path,
+        emit_json=bool(args.emit_json),
+        min_pass_rate=min_pass_rate,
+    )
 
 
 def handle_policy(args: argparse.Namespace) -> int:
@@ -2201,17 +2765,47 @@ def handle_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_value_is_explicit(args: argparse.Namespace, flag_name: str, default: Any) -> bool:
+    """Best-effort check: was a CLI flag explicitly set by the user?"""
+    value = getattr(args, flag_name, default)
+    return value != default
+
+
+def _resolve_setting(
+    args: argparse.Namespace,
+    profile: dict[str, Any],
+    cli_attr: str,
+    cli_default: Any,
+    *profile_keys: str,
+) -> Any:
+    """Profile precedence: CLI flag (if explicit) > profile value > CLI default."""
+    if _cli_value_is_explicit(args, cli_attr, cli_default):
+        return getattr(args, cli_attr)
+    for key in profile_keys:
+        if key in profile:
+            return profile[key]
+    return getattr(args, cli_attr, cli_default)
+
+
 def handle_deploy(args: argparse.Namespace) -> int:
     root = project_root()
     config = load_deploy_targets(root)
     profile = resolve_deploy_profile(config, args.profile)
 
-    image = str(profile.get("image", args.image))
-    tag = str(profile.get("tag", args.tag))
-    service = str(profile.get("service", args.service))
-    region = str(profile.get("region", args.region))
-    app_name = str(profile.get("app_name", args.app_name))
-    push = bool(profile.get("push", args.push))
+    image = str(_resolve_setting(args, profile, "image", "vex-app", "image"))
+    tag = str(_resolve_setting(args, profile, "tag", "latest", "tag"))
+    service = str(_resolve_setting(args, profile, "service", "vex-ai-service", "service"))
+    region = str(_resolve_setting(args, profile, "region", "us-central1", "region"))
+    app_name = str(
+        _resolve_setting(args, profile, "app_name", "vex-ai-app", "app_name", "app-name")
+    )
+    push = bool(_resolve_setting(args, profile, "push", False, "push"))
+
+    project_raw = _resolve_setting(args, profile, "project", None, "project")
+    project = str(project_raw) if project_raw else None
+
+    port_raw = _resolve_setting(args, profile, "port", None, "port")
+    port = int(port_raw) if port_raw is not None else None
 
     if args.target == "check":
         issues, lines = deploy_preflight(root, target=args.check_target, profile=profile)
@@ -2219,27 +2813,50 @@ def handle_deploy(args: argparse.Namespace) -> int:
             print(line)
         return 0 if issues == 0 else 1
 
+    # Run preflight when we're about to actually hit external systems.
+    if (args.apply or args.run) and not args.skip_preflight:
+        preflight_target = args.target if args.target in {"docker", "cloud-run", "modal"} else "all"
+        issues, lines = deploy_preflight(root, target=preflight_target, profile=profile)
+        for line in lines:
+            print(line)
+        if issues > 0:
+            print(
+                f"Preflight reported {issues} issue(s); aborting. "
+                "Re-run 'vex deploy check' or pass --skip-preflight to override.",
+                file=sys.stderr,
+            )
+            return 1
+
     if args.target == "docker":
-        return deploy_docker(root, image=image, tag=tag, push=push)
+        return deploy_docker(
+            root,
+            image=image,
+            tag=tag,
+            push=push,
+            run_container=bool(args.run),
+            port=port,
+        )
 
     if args.target == "cloud-run":
         path = scaffold_cloud_run(root, service=service, region=region, image=image, tag=tag)
         print(f"Wrote Cloud Run scaffold to {path}")
         if args.apply:
-            if shutil.which("gcloud") is None:
-                print("gcloud CLI not found")
-                return 127
-            return run_command(["gcloud", "run", "services", "replace", str(path), "--region", region], cwd=root)
+            return deploy_cloud_run(
+                root,
+                service=service,
+                region=region,
+                image=image,
+                tag=tag,
+                project=project,
+                profile=profile,
+            )
         return 0
 
     if args.target == "modal":
         path = scaffold_modal(root, app_name=app_name)
         print(f"Wrote Modal scaffold to {path}")
         if args.run:
-            if shutil.which("modal") is None:
-                print("modal CLI not found")
-                return 127
-            return run_command(["modal", "deploy", str(path)], cwd=root)
+            return deploy_modal(root, scaffold_path=path)
         return 0
 
     print("Unsupported deploy target")
