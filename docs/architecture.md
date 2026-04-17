@@ -2,7 +2,9 @@
 
 ## Goal
 
-`vex` should unify the Python app workflow without inventing a parallel packaging ecosystem.
+`vex` should unify the Python AI app workflow without inventing a parallel packaging ecosystem.
+
+It should explicitly build on top of `uv`, not compete with `uv`.
 
 ## MVP Principles
 
@@ -10,11 +12,12 @@
 2. Default to a local `.venv` per project.
 3. Prefer delegation to mature tools over reimplementation.
 4. Keep the command surface small.
-5. Optimize for app developers first, while remaining library-capable.
+5. Optimize for AI app developers first.
+6. Treat runtime choice, policy, and model packaging as first-class workflow concerns.
 
 ## Recommended Integration Stack
 
-### Core
+### Core Substrate
 
 - `uv`
   - Python installation and pinning
@@ -23,40 +26,40 @@
   - command execution
   - build and publish delegation
   - isolated tool execution
-- `pytest`
-  - default test runner
-- `ruff`
-  - lint and format
-- `mypy`
-  - default type checking
+### AI Workflow Layer
+
+- `vex-ai-runtime`
+  - secure packaged model artifacts
+  - native inference execution
+  - runtime policy enforcement
+- local model runtimes like `ollama`
+  - local development and fallback execution paths
+- eval and benchmark adapters
+  - local-first quality and performance loops
 - `watchfiles`
-  - generic dev reload support
-- `hatchling`
-  - default build backend in generated projects
+  - generic dev reload support for AI apps
 
 ### Later Phase
 
-- `cibuildwheel` for wheel CI
-- `PyInstaller` for user-facing standalone executables
-- `PEX` for hermetic internal app packaging
-- `maturin` for Rust acceleration paths
-- `mypyc` for typed Python hotspots
+- deployment adapters for Modal, BentoML, Baseten, or OCI-first workflows
+- policy-aware packaging for agent and model artifacts
+- richer local benchmark and eval integrations
 
 ## Non-Goals
 
 - custom dependency resolver
 - custom lockfile format in v0
 - custom build backend
-- cloud-agnostic deployment abstraction from day one
-- a new Python runtime in the initial product
+- a generic replacement for `uv`
+- a new general-purpose Python runtime in the initial `vex` product
 
-## Why A New Runtime Is Not The MVP
+## Why AI Workflow Is The Better Wedge
 
-Python can be made faster, but a Bun-style universal runtime replacement is much harder because:
+`uv` already solved a large part of generic Python workflow. The remaining open space is higher-level and AI-specific:
 
-- CPython compatibility matters deeply
-- many important packages depend on native extensions
-- a lot of real Python performance already lives outside the interpreter
-- startup and packaging constraints matter as much as runtime speed
+- local-first AI app workflow is still fragmented
+- model packaging and execution policy are not first-class in generic Python tools
+- deployment and runtime choices are still split across many products
+- AI app packaging is not the same thing as Python dependency management
 
-The better initial wedge is a unified workflow that can later add selective acceleration.
+The better wedge for `vex` is an AI-native workflow layer that can later orchestrate `vex-ai-runtime` and other execution backends.

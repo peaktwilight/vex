@@ -1,6 +1,6 @@
 # Roadmap
 
-## v0.1
+## Current Prototype
 
 - `vex init`
 - `vex add`
@@ -18,7 +18,23 @@
 - `vex publish`
 - `vex tool run|install|list|upgrade|uninstall`
 
-## v0.2
+These commands are useful bootstrap plumbing because they let `vex` ride on top of `uv`, but they are not the long-term moat.
+
+## Product Direction
+
+- `vex init agent`
+- `vex init inference-api`
+- `vex dev`
+- `vex benchmark`
+- `vex eval`
+- `vex policy`
+- `vex package-model`
+- `vex deploy`
+- `vex schema validate-model`
+- `vex run --sandbox`
+- `vex doctor ai`
+
+## Later
 
 - `vex export`
 - `vex shell`
@@ -27,15 +43,18 @@
 
 ## v1 Direction
 
-- polished project templates
-- container-oriented deployment helpers
-- optional packaging targets like PEX or PyInstaller
-- opt-in performance workflows for hot paths
+- polished AI project templates
+- container-oriented and runtime-aware deployment helpers
+- integration with `vex-ai-runtime`
+- local benchmark and evaluation workflows
+- opt-in secure packaging and policy enforcement
+- deployment adapters for Docker/OCI, Cloud Run, and Modal
 
 ## Product Guardrails
 
 - one project config: `pyproject.toml`
 - one default environment: `.venv`
-- one core install model: lock then sync
-- one clear execution path: `vex run`
+- one substrate for package/env management: `uv`
+- one clear local-first AI workflow
+- runtime and policy should be first-class, not bolted on later
 - escape hatches are allowed, but secondary

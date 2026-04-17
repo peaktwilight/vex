@@ -1,0 +1,6 @@
+{
+  "schema": "vex-model/v1",
+  "schema_version": "v1",
+  "runtime": "vex-ai-runtime",
+  "engine": "onnxruntime"
+}
