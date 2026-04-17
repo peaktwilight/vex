@@ -901,36 +901,253 @@ class CliTests(unittest.TestCase):
         self.assertIn("WARN docker/podman not found", output)
         self.assertIn("WARN gcloud CLI not found", output)
 
+    @patch("vex.cli.run_command_capture", return_value=(0, "https://svc-abcd-uw.a.run.app\n", ""))
     @patch("vex.cli.run_command", return_value=0)
+    @patch("vex.cli.detect_gcloud_project", return_value="demo-project")
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
     @patch("vex.cli.shutil.which", return_value="/usr/bin/gcloud")
-    def test_deploy_cloud_run_apply_invokes_gcloud(self, _which: object, run_command: object) -> None:
+    def test_deploy_cloud_run_apply_calls_gcloud_deploy(
+        self,
+        _which: object,
+        _uv_bin: object,
+        _docker: object,
+        _project: object,
+        run_command: object,
+        _run_capture: object,
+    ) -> None:
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             os.chdir(temp_dir)
             try:
-                code, _output = self.run_cli(["deploy", "cloud-run", "--apply", "--service", "svc", "--region", "us-west1"])
+                code, _output = self.run_cli(
+                    [
+                        "deploy",
+                        "cloud-run",
+                        "--apply",
+                        "--service",
+                        "svc",
+                        "--region",
+                        "us-west1",
+                        "--project",
+                        "demo-project",
+                        "--image",
+                        "gcr.io/demo-project/svc",
+                        "--tag",
+                        "v1",
+                    ]
+                )
             finally:
                 os.chdir(original_cwd)
 
         self.assertEqual(code, 0)
-        called_argv = run_command.call_args.args[0]
-        self.assertEqual(called_argv[0:4], ["gcloud", "run", "services", "replace"])
+        build_argv = run_command.call_args.args[0]
+        self.assertEqual(build_argv[0:3], ["gcloud", "builds", "submit"])
+        self.assertIn("gcr.io/demo-project/svc:v1", build_argv)
 
+        deploy_argv = _run_capture.call_args.args[0]
+        self.assertEqual(deploy_argv[0:4], ["gcloud", "run", "deploy", "svc"])
+        self.assertIn("--image", deploy_argv)
+        self.assertIn("gcr.io/demo-project/svc:v1", deploy_argv)
+        self.assertIn("--region", deploy_argv)
+        self.assertIn("us-west1", deploy_argv)
+        self.assertIn("--project", deploy_argv)
+        self.assertIn("demo-project", deploy_argv)
+
+    @patch("vex.cli.run_command_capture", return_value=(0, "https://svc.a.run.app\n", ""))
     @patch("vex.cli.run_command", return_value=0)
+    @patch("vex.cli.detect_gcloud_project", return_value="demo-project")
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    @patch("vex.cli.shutil.which", return_value="/usr/bin/gcloud")
+    def test_deploy_cloud_run_apply_respects_profile_interpolation(
+        self,
+        _which: object,
+        _uv_bin: object,
+        _docker: object,
+        _project: object,
+        run_command: object,
+        run_capture: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        previous_repo = os.environ.get("VEX_IMAGE_REPO")
+        os.environ["VEX_IMAGE_REPO"] = "gcr.io/demo"
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                (root / "deploy.targets.toml").write_text(
+                    "[profiles.default]\n"
+                    'image = "${VEX_IMAGE_REPO}/app"\n'
+                    'tag = "v7"\n'
+                    'service = "my-svc"\n'
+                    'region = "us-west1"\n'
+                    'project = "demo-project"\n'
+                    'memory = "1Gi"\n'
+                    'cpu = "2"\n'
+                    'min_instances = 1\n'
+                    'max_instances = 4\n'
+                    'service_account = "runner@demo-project.iam.gserviceaccount.com"\n',
+                    encoding="utf-8",
+                )
+                os.chdir(temp_dir)
+                try:
+                    code, _output = self.run_cli(["deploy", "cloud-run", "--apply"])
+                finally:
+                    os.chdir(original_cwd)
+        finally:
+            if previous_repo is None:
+                os.environ.pop("VEX_IMAGE_REPO", None)
+            else:
+                os.environ["VEX_IMAGE_REPO"] = previous_repo
+
+        self.assertEqual(code, 0)
+        build_argv = run_command.call_args.args[0]
+        self.assertIn("gcr.io/demo/app:v7", build_argv)
+
+        deploy_argv = run_capture.call_args.args[0]
+        self.assertIn("gcr.io/demo/app:v7", deploy_argv)
+        self.assertIn("--memory", deploy_argv)
+        self.assertIn("1Gi", deploy_argv)
+        self.assertIn("--cpu", deploy_argv)
+        self.assertIn("2", deploy_argv)
+        self.assertIn("--min-instances", deploy_argv)
+        self.assertIn("1", deploy_argv)
+        self.assertIn("--max-instances", deploy_argv)
+        self.assertIn("4", deploy_argv)
+        self.assertIn("--service-account", deploy_argv)
+        self.assertIn("runner@demo-project.iam.gserviceaccount.com", deploy_argv)
+
+    @patch("vex.cli.run_command_capture")
+    @patch("vex.cli.run_command")
+    @patch("vex.cli.deploy_preflight", return_value=(2, ["WARN missing tool"]))
+    def test_deploy_cloud_run_apply_runs_preflight_first(
+        self,
+        _preflight: object,
+        run_command: object,
+        run_capture: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    ["deploy", "cloud-run", "--apply", "--service", "svc", "--project", "p"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn("WARN missing tool", output)
+        run_command.assert_not_called()
+        run_capture.assert_not_called()
+
+    @patch(
+        "vex.cli.run_command_capture",
+        return_value=(
+            0,
+            "Building...\n✓ Created web endpoint => https://acme--demo-app.modal.run\n",
+            "",
+        ),
+    )
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
     @patch("vex.cli.shutil.which")
-    def test_deploy_modal_run_invokes_modal_cli(self, which_mock: object, run_command: object) -> None:
+    def test_deploy_modal_run_invokes_modal_cli(
+        self,
+        which_mock: object,
+        _uv_bin: object,
+        _docker: object,
+        run_capture: object,
+    ) -> None:
         which_mock.side_effect = lambda name: "/usr/bin/modal" if name == "modal" else None
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             os.chdir(temp_dir)
             try:
-                code, _output = self.run_cli(["deploy", "modal", "--run", "--app-name", "demo-app"])
+                code, _output = self.run_cli(
+                    [
+                        "deploy",
+                        "modal",
+                        "--run",
+                        "--app-name",
+                        "demo-app",
+                        "--skip-preflight",
+                    ]
+                )
             finally:
                 os.chdir(original_cwd)
 
         self.assertEqual(code, 0)
-        called_argv = run_command.call_args.args[0]
+        called_argv = run_capture.call_args.args[0]
         self.assertEqual(called_argv[0:2], ["modal", "deploy"])
+        # Scaffold path should be passed as third arg.
+        self.assertTrue(called_argv[2].endswith("modal_app.py"))
+
+    @patch(
+        "vex.cli.run_command_capture",
+        return_value=(
+            0,
+            "View app at https://acme--demo-app.modal.run\n",
+            "",
+        ),
+    )
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    @patch("vex.cli.shutil.which")
+    def test_deploy_modal_run_surfaces_deployed_url(
+        self,
+        which_mock: object,
+        _uv_bin: object,
+        _docker: object,
+        _run_capture: object,
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/bin/modal" if name == "modal" else None
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "deploy",
+                        "modal",
+                        "--run",
+                        "--app-name",
+                        "demo-app",
+                        "--skip-preflight",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        self.assertIn("Deployed: https://acme--demo-app.modal.run", output)
+
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_deploy_docker_run_builds_and_runs_image(
+        self, run_command: object, _docker: object
+    ) -> None:
+        code, _output = self.run_cli(
+            [
+                "deploy",
+                "docker",
+                "--image",
+                "ghcr.io/acme/app",
+                "--tag",
+                "v1",
+                "--run",
+                "--port",
+                "8080",
+                "--skip-preflight",
+            ]
+        )
+        self.assertEqual(code, 0)
+        argvs = [call.args[0] for call in run_command.call_args_list]
+        self.assertEqual(argvs[0], ["docker", "build", "-t", "ghcr.io/acme/app:v1", "."])
+        self.assertEqual(
+            argvs[-1],
+            ["docker", "run", "--rm", "-p", "8080:8080", "ghcr.io/acme/app:v1"],
+        )
 
 
 if __name__ == "__main__":
