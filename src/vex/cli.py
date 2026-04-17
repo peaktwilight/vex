@@ -53,6 +53,10 @@ DEFAULT_SCRIPT_COMMANDS = {
 
 PASSTHROUGH_COMMANDS = {"run", "test", "lint", "format", "typecheck", "dev"}
 AI_TEMPLATES = {"agent", "inference-api"}
+# Python floor used by scaffolded projects when the user does not pass --python.
+# Kept conservative so fresh projects stay portable across common developer machines.
+DEFAULT_SCAFFOLD_PYTHON = "3.12"
+DEFAULT_SCAFFOLD_REQUIRES_PYTHON = ">=3.11"
 VEX_MODEL_SCHEMA_VERSION = "v1"
 VEX_RUNTIME_NAME = "vex-ai-runtime"
 VEX_MODEL_SCHEMA_ID = "vex-model/v1"
@@ -268,6 +272,30 @@ def detect_promptfoo_config(root: Path) -> Path | None:
     return None
 
 
+def detect_inspect_config(root: Path) -> Path | None:
+    """Locate an Inspect AI eval entrypoint in the project root.
+
+    Detection order:
+    1. ``inspect.yaml`` / ``inspect.toml`` at the project root (config-style).
+    2. First ``evals/*.inspect.py`` file discovered (task-style entrypoint).
+
+    Returns the resolved path, or ``None`` when no Inspect AI config is
+    present. The returned path doubles as the argument passed to
+    ``inspect eval`` — for config files, Inspect resolves tasks relative to
+    the config; for ``*.inspect.py`` files, it runs the file directly.
+    """
+    for candidate in ("inspect.yaml", "inspect.yml", "inspect.toml"):
+        path = root / candidate
+        if path.exists() and path.is_file():
+            return path
+    evals_dir = root / "evals"
+    if evals_dir.is_dir():
+        matches = sorted(evals_dir.glob("*.inspect.py"))
+        if matches:
+            return matches[0]
+    return None
+
+
 def load_vex_policy(root: Path) -> dict[str, object]:
     data = load_pyproject(root)
     policy = data.get("tool", {}).get("vex", {}).get("policy", {})
@@ -462,6 +490,7 @@ def doctor_checks(root: Path, scope: str | None = None) -> tuple[int, list[str]]
                     )
 
         issues += _append_ai_provider_checks(root, lines)
+        _append_observability_checks(lines)
         issues += _append_eval_dataset_checks(root, lines)
         issues += _append_deploy_env_checks(root, lines)
 
@@ -550,6 +579,48 @@ def _append_ai_provider_checks(root: Path, lines: list[str]) -> int:
             )
 
     return issues
+
+
+def _append_observability_checks(lines: list[str]) -> None:
+    """Report observability configuration (soft warn — observability is optional)."""
+    logfire_token = os.environ.get("LOGFIRE_TOKEN")
+    otel_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+    if logfire_token:
+        lines.append("OK  observability: logfire")
+        return
+
+    if otel_endpoint:
+        host = _otel_endpoint_host(otel_endpoint)
+        lines.append(f"OK  observability: otel endpoint={host}")
+        return
+
+    lines.append(
+        "WARN no observability configured "
+        "(set LOGFIRE_TOKEN or OTEL_EXPORTER_OTLP_ENDPOINT)"
+    )
+
+
+def _otel_endpoint_host(endpoint: str) -> str:
+    """Strip path and credentials from an OTLP endpoint URL, returning host[:port]."""
+    from urllib.parse import urlparse
+
+    raw = endpoint.strip()
+    parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="")
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    if not host:
+        # Fall back to stripping trailing path/query/fragment manually for values
+        # like "collector:4317" that urlparse may not decompose reliably.
+        cleaned = raw.split("?", 1)[0].split("#", 1)[0]
+        if "://" in cleaned:
+            cleaned = cleaned.split("://", 1)[1]
+        if "@" in cleaned:
+            cleaned = cleaned.split("@", 1)[1]
+        cleaned = cleaned.split("/", 1)[0]
+        host = cleaned
+    return host
 
 
 def _append_eval_dataset_checks(root: Path, lines: list[str]) -> int:
@@ -683,6 +754,9 @@ def append_vex_config(root: Path, package_mode: bool, template: str | None, pack
                 "  \"deepeval>=0.21\",\n"
                 "  \"ragas>=0.2\",\n"
                 "]\n"
+                "observability = [\n"
+                "  \"logfire>=3.0\",\n"
+                "]\n"
             )
     if template == "inference-api":
         dev_script = f"python -m {package_name}.api"
@@ -742,8 +816,15 @@ def init_project_dir(path_arg: str | None) -> Path:
     return project_root()
 
 
-def build_init_args(args: argparse.Namespace, init_path: str | None) -> tuple[list[str], Path, bool]:
-    package_mode = bool(args.lib)
+def build_init_args(
+    args: argparse.Namespace,
+    init_path: str | None,
+    template: str | None = None,
+) -> tuple[list[str], Path, bool]:
+    # Agent / inference-api templates install as editable packages so their
+    # scaffolded `python -m <pkg>.main` dev commands resolve without PYTHONPATH.
+    ai_template = template in AI_TEMPLATES
+    package_mode = bool(args.lib) or ai_template
     uv_args = ["init"]
 
     if init_path:
@@ -752,15 +833,54 @@ def build_init_args(args: argparse.Namespace, init_path: str | None) -> tuple[li
         uv_args.extend(["--name", args.name])
     if args.python:
         uv_args.extend(["--python", args.python])
+    else:
+        # Avoid inheriting whatever Python is newest on the scaffolder's
+        # machine (e.g. 3.14) which makes the generated project unusable on
+        # typical developer machines. The floor is normalized again post-init.
+        uv_args.extend(["--python", DEFAULT_SCAFFOLD_PYTHON])
 
     uv_args.extend(["--vcs", "none", "--no-workspace"])
 
     if args.lib:
         uv_args.extend(["--lib", "--package", "--build-backend", "hatch"])
+    elif ai_template:
+        uv_args.extend(["--package", "--build-backend", "hatch"])
     else:
         uv_args.extend(["--app", "--no-package"])
 
     return uv_args, init_project_dir(init_path), package_mode
+
+
+def normalize_python_pin(root: Path, requested: str | None) -> None:
+    """Pin scaffolded projects to a portable Python floor.
+
+    `uv init` inherits the newest interpreter available on the scaffolder's
+    machine, which produces unusable `requires-python` pins (e.g. `>=3.14`)
+    when the user did not explicitly request a version. Rewrite both the
+    pyproject constraint and `.python-version` to stable defaults when the
+    user did not pass `--python`.
+    """
+    if requested:
+        return
+
+    pyproject_path = root / "pyproject.toml"
+    if pyproject_path.exists():
+        content = pyproject_path.read_text(encoding="utf-8")
+        new_content = re.sub(
+            r'^requires-python\s*=\s*"[^"]*"',
+            f'requires-python = "{DEFAULT_SCAFFOLD_REQUIRES_PYTHON}"',
+            content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if new_content != content:
+            pyproject_path.write_text(new_content, encoding="utf-8")
+
+    python_version_path = root / ".python-version"
+    if python_version_path.exists():
+        python_version_path.write_text(
+            f"{DEFAULT_SCAFFOLD_PYTHON}\n", encoding="utf-8"
+        )
 
 
 def write_file(path: Path, content: str) -> None:
@@ -854,7 +974,15 @@ def scaffold_agent_template(root: Path, package_name: str) -> None:
         (
             "from __future__ import annotations\n\n"
             "import asyncio\n"
+            "import os\n"
             "import sys\n\n"
+            "if os.environ.get(\"LOGFIRE_TOKEN\"):\n"
+            "    try:\n"
+            "        import logfire\n\n"
+            "        logfire.configure()\n"
+            "        logfire.instrument_pydantic_ai()\n"
+            "    except ImportError:\n"
+            "        pass\n\n"
             "from .agent import build_agent\n"
             "from .settings import Settings\n\n\n"
             "async def _run(prompt: str) -> str:\n"
@@ -992,7 +1120,11 @@ def scaffold_agent_template(root: Path, package_name: str) -> None:
             "# VEX_OPENAI_MODEL=gpt-4o-mini\n"
             "# VEX_ANTHROPIC_MODEL=claude-3-5-sonnet-latest\n"
             "# VEX_OLLAMA_MODEL=llama3.2\n"
-            "# VEX_OLLAMA_BASE_URL=http://localhost:11434/v1\n"
+            "# VEX_OLLAMA_BASE_URL=http://localhost:11434/v1\n\n"
+            "# Observability (optional)\n"
+            "# LOGFIRE_TOKEN=pylf_v1_...\n"
+            "# OTEL_EXPORTER_OTLP_ENDPOINT=https://your-otel-collector\n"
+            "# OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20...\n"
         ),
     )
     write_file(
@@ -1581,6 +1713,323 @@ def run_eval_promptfoo_adapter(
         print(f"Eval report written to {out_path}")
         print(
             f"adapter=promptfoo passed={report['passed']} failed={report['failed']} "
+            f"pass_rate={report['pass_rate']}%"
+        )
+
+    exit_code = completed.returncode
+    if exit_code == 0 and report["failed"] > 0:
+        exit_code = 1
+    return _apply_min_pass_rate(report, min_pass_rate, exit_code)
+
+
+def _inspect_binary() -> tuple[list[str], str] | None:
+    """Resolve a command list capable of invoking Inspect AI.
+
+    Prefers ``uvx --from inspect-ai inspect`` (the package ships the
+    ``inspect`` executable, not ``inspect-ai``) and falls back to a system
+    ``inspect`` on PATH.
+    """
+    uvx = shutil.which("uvx")
+    if uvx:
+        return [uvx, "--from", "inspect-ai", "inspect"], "uvx"
+    inspect = shutil.which("inspect")
+    if inspect:
+        return [inspect], "inspect"
+    return None
+
+
+def _coerce_inspect_input(raw: Any) -> str:
+    """Flatten Inspect's sample input (string or list of chat messages)."""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, list):
+        parts: list[str] = []
+        for msg in raw:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        parts.append(block["text"])
+        return "\n".join(p for p in parts if p)
+    if raw is None:
+        return ""
+    return str(raw)
+
+
+def _coerce_inspect_output(output: Any) -> str:
+    """Extract assistant text from an Inspect ``ModelOutput`` payload."""
+    if not isinstance(output, dict):
+        return str(output) if output is not None else ""
+    completion = output.get("completion")
+    if isinstance(completion, str) and completion:
+        return completion
+    choices = output.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content:
+                    return content
+                if isinstance(content, list):
+                    for block in content:
+                        if (
+                            isinstance(block, dict)
+                            and isinstance(block.get("text"), str)
+                            and block["text"]
+                        ):
+                            return block["text"]
+    return ""
+
+
+def _coerce_inspect_score(scores: Any) -> tuple[bool | None, float | None]:
+    """Collapse Inspect's per-scorer map into (passed, numeric_score).
+
+    Inspect scores are arbitrary (``"C"`` / ``"I"`` for correct/incorrect,
+    numeric metrics, booleans, dicts, etc.). We try the common shapes:
+    the string ``"C"`` is treated as passing, booleans map directly,
+    and numbers >= 0.5 are treated as passing.
+    """
+    if not isinstance(scores, dict) or not scores:
+        return None, None
+    # Prefer a scorer named ``"accuracy"`` or ``"includes"`` / ``"match"``
+    # when present; otherwise take the first deterministic entry.
+    preferred = ("accuracy", "includes", "match", "exact", "correct")
+    ordered_keys = [k for k in preferred if k in scores]
+    ordered_keys += [k for k in sorted(scores) if k not in preferred]
+
+    for key in ordered_keys:
+        score_obj = scores.get(key)
+        if not isinstance(score_obj, dict):
+            continue
+        value = score_obj.get("value")
+        numeric: float | None = None
+        passed: bool | None = None
+        if isinstance(value, bool):
+            passed = value
+            numeric = 1.0 if value else 0.0
+        elif isinstance(value, (int, float)):
+            numeric = float(value)
+            passed = numeric >= 0.5
+        elif isinstance(value, str):
+            upper = value.strip().upper()
+            if upper in {"C", "CORRECT", "PASS", "TRUE", "YES"}:
+                passed, numeric = True, 1.0
+            elif upper in {"I", "INCORRECT", "FAIL", "FALSE", "NO"}:
+                passed, numeric = False, 0.0
+            elif upper in {"P", "PARTIAL"}:
+                passed, numeric = False, 0.5
+        if passed is not None or numeric is not None:
+            return passed, numeric
+    return None, None
+
+
+def normalize_inspect_report(
+    raw: dict[str, Any],
+    *,
+    command: str | None,
+    dataset_path: Path,
+    config_path: Path,
+) -> dict[str, Any]:
+    """Map an Inspect AI ``EvalLog`` JSON to the ``vex-eval/v1`` schema.
+
+    Inspect writes one JSON document per eval run (via ``--log-format
+    json``). Top-level keys we care about: ``eval`` (with ``.model`` and
+    ``.task``), ``samples`` (list of ``EvalSample``), ``results`` (with
+    aggregate ``total_samples`` / ``completed_samples``). This function is
+    deliberately defensive: missing keys degrade to empty strings rather
+    than raising.
+    """
+    payload: dict[str, Any] = raw if isinstance(raw, dict) else {}
+
+    eval_spec = payload.get("eval") if isinstance(payload.get("eval"), dict) else {}
+    default_provider = str(eval_spec.get("model") or "")
+
+    samples_any = payload.get("samples")
+    samples: list[dict[str, Any]] = (
+        [s for s in samples_any if isinstance(s, dict)]
+        if isinstance(samples_any, list)
+        else []
+    )
+
+    normalized_cases: list[dict[str, Any]] = []
+    passed = 0
+    for index, sample in enumerate(samples, start=1):
+        input_text = _coerce_inspect_input(sample.get("input"))
+        output_text = _coerce_inspect_output(sample.get("output"))
+
+        sample_passed, numeric_score = _coerce_inspect_score(sample.get("scores"))
+        # An explicit ``error`` block means the sample did not complete.
+        error_obj = sample.get("error")
+        if isinstance(error_obj, dict) and error_obj:
+            sample_passed = False
+
+        if sample_passed is True:
+            passed += 1
+        case_passed = bool(sample_passed) if sample_passed is not None else False
+
+        latency_ms: float | None = None
+        for key in ("total_time", "working_time"):
+            raw_latency = sample.get(key)
+            if isinstance(raw_latency, (int, float)):
+                latency_ms = float(raw_latency) * 1000.0
+                break
+        if latency_ms is None:
+            model_output = sample.get("output")
+            if isinstance(model_output, dict):
+                timing = model_output.get("time")
+                if isinstance(timing, (int, float)):
+                    latency_ms = float(timing) * 1000.0
+
+        normalized_cases.append(
+            {
+                "index": index,
+                "input": input_text,
+                "output": output_text,
+                "passed": case_passed,
+                "provider": default_provider,
+                "latency_ms": latency_ms,
+                "score": numeric_score,
+            }
+        )
+
+    # Prefer Inspect's own counters when available, falling back to derived.
+    results_block = payload.get("results") if isinstance(payload.get("results"), dict) else {}
+    total_samples = results_block.get("total_samples") if isinstance(results_block, dict) else None
+    if not isinstance(total_samples, int) or total_samples < 0:
+        total_samples = len(normalized_cases)
+
+    failed = max(0, total_samples - passed) if normalized_cases else 0
+    pass_rate = (
+        round((passed / total_samples) * 100, 2) if total_samples else 0.0
+    )
+
+    return {
+        "schema": "vex-eval/v1",
+        "adapter": "inspect",
+        "mode": "inspect",
+        "command": command,
+        "config": str(config_path),
+        "dataset": str(dataset_path),
+        "dataset_case_count": total_samples,
+        "passed": passed,
+        "failed": failed,
+        "pass_rate": pass_rate,
+        "results": normalized_cases,
+    }
+
+
+def run_eval_inspect_adapter(
+    root: Path,
+    config_path: Path,
+    dataset_path: Path,
+    out_path: Path,
+    *,
+    timeout: float,
+    emit_json: bool,
+    min_pass_rate: float | None,
+) -> int:
+    """Delegate to a locally discovered Inspect AI CLI.
+
+    Runs ``inspect eval <task> --log-dir <tmp> --log-format json`` and
+    normalizes the resulting log into the ``vex-eval/v1`` schema.
+    """
+    binary = _inspect_binary()
+    if binary is None:
+        print(
+            "vex eval inspect adapter requires 'uvx' or 'inspect' on PATH. "
+            "Install uv (https://docs.astral.sh/uv/) or pass --adapter harness "
+            "to use the built-in Python harness."
+        )
+        return 127
+    command_list, runner_name = binary
+
+    tmp_log_dir = Path(tempfile.mkdtemp(prefix="vex-inspect-"))
+    try:
+        argv = [
+            *command_list,
+            "eval",
+            str(config_path),
+            "--log-dir",
+            str(tmp_log_dir),
+            "--log-format",
+            "json",
+        ]
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"inspect adapter timed out after {timeout}s "
+                f"(runner={runner_name}). Increase --timeout if needed."
+            )
+            return 124
+        except FileNotFoundError:
+            print(f"inspect adapter failed: {runner_name} not found")
+            return 127
+
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+
+        # Inspect writes one JSON log per eval run into the log dir.
+        raw_report: dict[str, Any] = {}
+        if tmp_log_dir.is_dir():
+            log_files = sorted(tmp_log_dir.glob("*.json"))
+            for candidate in log_files:
+                try:
+                    text = candidate.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                if not text.strip():
+                    continue
+                try:
+                    parsed = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    raw_report = parsed
+                    break
+    finally:
+        try:
+            shutil.rmtree(tmp_log_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+    if completed.returncode != 0 and not raw_report:
+        if stdout.strip():
+            print(stdout.rstrip())
+        if stderr.strip():
+            print(stderr.rstrip(), file=sys.stderr)
+        print(
+            f"inspect exited with code {completed.returncode} "
+            f"(runner={runner_name})"
+        )
+        return completed.returncode if completed.returncode != 0 else 1
+
+    report = normalize_inspect_report(
+        raw_report,
+        command=f"{runner_name} inspect",
+        dataset_path=dataset_path,
+        config_path=config_path,
+    )
+
+    _emit_eval_report(report, out_path, emit_json)
+    if not emit_json:
+        print(f"Eval report written to {out_path}")
+        print(
+            f"adapter=inspect passed={report['passed']} failed={report['failed']} "
             f"pass_rate={report['pass_rate']}%"
         )
 
@@ -2202,16 +2651,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fail the run when pass_rate falls below this fraction (0.0-1.0).",
     )
     eval_parser.add_argument(
+        "--adapter",
+        dest="adapter",
+        choices=["auto", "inspect", "promptfoo", "harness"],
+        default=None,
+        help=(
+            "Eval adapter: 'inspect' (Inspect AI, default when inspect.yaml / "
+            "evals/*.inspect.py exists), 'promptfoo' (when promptfooconfig.yaml "
+            "exists), 'harness' (built-in Python runner), or 'auto' (prefer "
+            "inspect, fall back to promptfoo, then harness)."
+        ),
+    )
+    eval_parser.add_argument(
         "--no-promptfoo",
         dest="no_promptfoo",
         action="store_true",
-        help="Force the built-in Python harness even if promptfooconfig.yaml exists.",
+        help=(
+            "DEPRECATED: use --adapter harness. Forces the built-in Python "
+            "harness even when an adapter config is present."
+        ),
     )
     eval_parser.add_argument(
         "--timeout",
         type=float,
         default=300.0,
-        help="Timeout (seconds) for the promptfoo subprocess (default: 300).",
+        help="Timeout (seconds) for the adapter subprocess (default: 300).",
     )
     eval_parser.add_argument("args", nargs=argparse.REMAINDER)
     eval_parser.set_defaults(handler=handle_eval)
@@ -2384,9 +2848,10 @@ def handle_init(args: argparse.Namespace) -> int:
         print(str(exc))
         return 2
 
-    uv_args, root, package_mode = build_init_args(args, init_path)
+    uv_args, root, package_mode = build_init_args(args, init_path, template=template)
     code = run_uv(uv_args)
     if code == 0:
+        normalize_python_pin(root, args.python)
         package_name = default_package_name(root, args.name)
         append_vex_config(root, package_mode=package_mode, template=template, package_name=package_name)
         scaffold_ai_template(root, template=template, package_name=package_name)
@@ -2601,38 +3066,86 @@ def handle_eval(args: argparse.Namespace) -> int:
             return 2
 
     # Adapter selection precedence:
-    # 1. explicit --command -> always use harness
-    # 2. --no-promptfoo CLI flag -> always use harness
-    # 3. [tool.vex.eval].adapter = "harness" | "promptfoo" | "auto"
-    # 4. "auto": delegate when promptfooconfig.yaml is present
-    adapter_setting = str(eval_config.get("adapter", "auto")).lower()
-    if adapter_setting not in {"auto", "promptfoo", "harness"}:
+    # 1. explicit --command -> always use harness (per-case or single)
+    # 2. --no-promptfoo (deprecated) -> treat as --adapter harness, warn
+    # 3. --adapter CLI flag (inspect | promptfoo | harness | auto)
+    # 4. [tool.vex.eval].adapter = "inspect" | "promptfoo" | "harness" | "auto"
+    # 5. "auto": prefer Inspect AI config, fall back to promptfoo, then harness
+    cli_adapter: str | None = getattr(args, "adapter", None)
+    if args.no_promptfoo:
+        print(
+            "vex eval: --no-promptfoo is deprecated and will be removed in a "
+            "future release. Use --adapter harness instead.",
+            file=sys.stderr,
+        )
+        if cli_adapter is None:
+            cli_adapter = "harness"
+
+    configured_adapter = str(eval_config.get("adapter", "auto")).lower()
+    if configured_adapter not in {"auto", "inspect", "promptfoo", "harness"}:
+        configured_adapter = "auto"
+
+    adapter_setting = (cli_adapter or configured_adapter).lower()
+    if adapter_setting not in {"auto", "inspect", "promptfoo", "harness"}:
         adapter_setting = "auto"
 
     explicit_command = args.command is not None
-    use_promptfoo = False
-    config_path: Path | None = None
 
-    if not explicit_command and not args.no_promptfoo:
-        if adapter_setting == "promptfoo":
-            config_path = detect_promptfoo_config(root)
-            if config_path is None:
+    selected_adapter: str | None = None
+    inspect_path: Path | None = None
+    promptfoo_path: Path | None = None
+
+    if not explicit_command and adapter_setting != "harness":
+        if adapter_setting == "inspect":
+            inspect_path = detect_inspect_config(root)
+            if inspect_path is None:
+                # Explicit --adapter inspect: require a real task path so the
+                # Inspect CLI has something to run. Otherwise Inspect would
+                # error opaquely.
+                print(
+                    "vex eval adapter='inspect' but no inspect.yaml / "
+                    "inspect.toml / evals/*.inspect.py was found at the project "
+                    "root. Create one or pass --adapter harness."
+                )
+                return 2
+            selected_adapter = "inspect"
+        elif adapter_setting == "promptfoo":
+            promptfoo_path = detect_promptfoo_config(root)
+            if promptfoo_path is None:
                 print(
                     "vex eval adapter='promptfoo' but no promptfooconfig.yaml "
                     "was found at the project root"
                 )
                 return 2
-            use_promptfoo = True
+            selected_adapter = "promptfoo"
         elif adapter_setting == "auto":
-            config_path = detect_promptfoo_config(root)
-            use_promptfoo = config_path is not None
+            inspect_path = detect_inspect_config(root)
+            if inspect_path is not None:
+                selected_adapter = "inspect"
+            else:
+                promptfoo_path = detect_promptfoo_config(root)
+                if promptfoo_path is not None:
+                    selected_adapter = "promptfoo"
 
-    if use_promptfoo and config_path is not None:
+    if selected_adapter == "inspect" and inspect_path is not None:
+        dataset_path = root / args.dataset
+        out_path = root / args.out
+        return run_eval_inspect_adapter(
+            root,
+            config_path=inspect_path,
+            dataset_path=dataset_path,
+            out_path=out_path,
+            timeout=max(1.0, float(args.timeout)),
+            emit_json=bool(args.emit_json),
+            min_pass_rate=min_pass_rate,
+        )
+
+    if selected_adapter == "promptfoo" and promptfoo_path is not None:
         dataset_path = root / args.dataset
         out_path = root / args.out
         return run_eval_promptfoo_adapter(
             root,
-            config_path=config_path,
+            config_path=promptfoo_path,
             dataset_path=dataset_path,
             out_path=out_path,
             timeout=max(1.0, float(args.timeout)),

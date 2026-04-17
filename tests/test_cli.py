@@ -398,11 +398,14 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn('template = "agent"', pyproject_text)
+        self.assertIn("package-mode = true", pyproject_text)
         self.assertIn('dev = "python -m support_agent.main"', pyproject_text)
         self.assertIn('benchmark = "python -m support_agent.benchmark"', pyproject_text)
         self.assertIn('eval = "python evals/run_eval.py --input {input}"', pyproject_text)
         self.assertIn('[project.optional-dependencies]', pyproject_text)
         self.assertIn('"pydantic-ai>=0.0.0"', pyproject_text)
+        self.assertIn('observability = [', pyproject_text)
+        self.assertIn('"logfire>=3.0"', pyproject_text)
         self.assertTrue(has_deploy_targets)
         self.assertTrue(has_prompt)
         self.assertTrue(has_dataset)
@@ -415,9 +418,17 @@ class CliTests(unittest.TestCase):
         self.assertIn("resolve_provider", settings_src)
         self.assertIn("ollama", settings_src)
         self.assertIn("build_agent", main_src)
+        self.assertIn('if os.environ.get("LOGFIRE_TOKEN"):', main_src)
+        self.assertIn("import logfire", main_src)
+        self.assertIn("logfire.configure()", main_src)
+        self.assertIn("logfire.instrument_pydantic_ai()", main_src)
+        self.assertIn("except ImportError:", main_src)
         self.assertIn("asyncio.run", eval_src)
         self.assertIn("OPENAI_API_KEY", env_example)
         self.assertIn("VEX_OLLAMA_MODEL", env_example)
+        self.assertIn("LOGFIRE_TOKEN=pylf_v1_...", env_example)
+        self.assertIn("OTEL_EXPORTER_OTLP_ENDPOINT=", env_example)
+        self.assertIn("OTEL_EXPORTER_OTLP_HEADERS=", env_example)
 
         for name, source in [
             ("agent.py", agent_src),
@@ -433,6 +444,23 @@ class CliTests(unittest.TestCase):
         for line in case_lines:
             parsed = _json.loads(line)
             self.assertIn("input", parsed)
+
+    def test_init_agent_produces_portable_python_floor(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(["init", "agent", "portable-agent"])
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "portable-agent"
+            pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+            python_version = (root / ".python-version").read_text(encoding="utf-8").strip()
+
+        self.assertEqual(code, 0)
+        self.assertIn('requires-python = ">=3.11"', pyproject)
+        self.assertEqual(python_version, "3.12")
 
     def test_init_inference_api_creates_template_files(self) -> None:
         original_cwd = os.getcwd()
@@ -671,6 +699,131 @@ class CliTests(unittest.TestCase):
         self.assertIn(
             "WARN deploy.targets.toml references unbound env vars: "
             "VEX_DEPLOY_REGION, VEX_IMAGE_REPO",
+            output,
+        )
+
+    @patch.dict(os.environ, {"LOGFIRE_TOKEN": "pylf_v1_fake"}, clear=True)
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_reports_observability_logfire(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("OK  observability: logfire", output)
+        self.assertNotIn("WARN no observability configured", output)
+
+    @patch.dict(
+        os.environ,
+        {"OTEL_EXPORTER_OTLP_ENDPOINT": "https://user:pass@collector.example.com:4318/v1/traces"},
+        clear=True,
+    )
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_reports_observability_otel(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("OK  observability: otel endpoint=collector.example.com:4318", output)
+        # Credentials and path must be stripped from the reported host.
+        self.assertNotIn("user:pass", output)
+        self.assertNotIn("/v1/traces", output)
+        self.assertNotIn("WARN no observability configured", output)
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-testkey"}, clear=True)
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_warns_no_observability_soft(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_root = root / "engine" / "vex-ai-runtime"
+            (runtime_root / "schemas").mkdir(parents=True)
+            (runtime_root / "schemas" / "vex-model-schema.json").write_text(
+                '{"schema":"vex-model/v1","schema_version":"v1","runtime":"vex-ai-runtime","engine":"onnxruntime"}\n',
+                encoding="utf-8",
+            )
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.env]\npath = \".venv\"\n\n"
+                "[tool.vex.scripts]\n"
+                'dev = "python -m demo.main"\n'
+                'benchmark = "python -m demo.benchmark"\n'
+                'eval = "python evals/run_eval.py --input {input}"\n'
+                'test = "pytest"\n\n'
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            (root / "deploy.targets.toml").write_text(
+                "[profiles.default]\n"
+                'image = "ghcr.io/example/demo"\n',
+                encoding="utf-8",
+            )
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            (root / ".venv").mkdir()
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        # Missing observability is a soft warning — must not cause non-zero exit
+        # (only the provider key is set, and all other AI checks are green).
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "WARN no observability configured "
+            "(set LOGFIRE_TOKEN or OTEL_EXPORTER_OTLP_ENDPOINT)",
             output,
         )
 
@@ -1159,6 +1312,396 @@ class CliTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["latency_ms"], 42.0)
         self.assertEqual(report["results"][0]["passed"], True)
         self.assertEqual(report["results"][1]["passed"], False)
+
+    # ------------------------------------------------------------------
+    # Inspect AI adapter
+    # ------------------------------------------------------------------
+
+    def _write_inspect_log(self, log_dir: Path, payload: dict) -> None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "run-1.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_detects_inspect_config(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            log_dir = Path(argv[argv.index("--log-dir") + 1])
+            self._write_inspect_log(
+                log_dir,
+                {
+                    "eval": {"model": "openai/gpt-4o-mini", "task": "theory"},
+                    "results": {"total_samples": 1, "completed_samples": 1},
+                    "samples": [
+                        {
+                            "id": "s1",
+                            "input": "hello",
+                            "output": {
+                                "completion": "hi",
+                                "time": 0.123,
+                            },
+                            "scores": {"accuracy": {"value": "C"}},
+                        }
+                    ],
+                },
+            )
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "inspect.yaml").write_text("tasks: []\n", encoding="utf-8")
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    ["eval", "--out", "artifacts/evals/inspect.json"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "inspect.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("adapter=inspect", output)
+        self.assertEqual(report["adapter"], "inspect")
+        self.assertEqual(report["schema"], "vex-eval/v1")
+        self.assertEqual(subprocess_run.call_count, 1)
+        invoked_argv = subprocess_run.call_args.args[0]
+        self.assertEqual(
+            invoked_argv[:5],
+            ["/usr/local/bin/uvx", "--from", "inspect-ai", "inspect", "eval"],
+        )
+        self.assertIn("--log-dir", invoked_argv)
+        self.assertIn("--log-format", invoked_argv)
+        self.assertEqual(
+            invoked_argv[invoked_argv.index("--log-format") + 1], "json"
+        )
+
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_adapter_flag_forces_inspect(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                # No inspect config file present -> adapter=inspect must error.
+                code, output = self.run_cli(["eval", "--adapter", "inspect"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 2)
+        self.assertIn("adapter='inspect'", output)
+        subprocess_run.assert_not_called()
+
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_adapter_flag_forces_promptfoo(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            output_path = Path(argv[argv.index("--output") + 1])
+            output_path.write_text(json.dumps({"results": {"results": []}}), encoding="utf-8")
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # Both configs present; --adapter promptfoo must win.
+            (root / "inspect.yaml").write_text("tasks: []\n", encoding="utf-8")
+            (root / "promptfooconfig.yaml").write_text(
+                "providers: []\n", encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--adapter",
+                        "promptfoo",
+                        "--out",
+                        "artifacts/evals/forced-pf.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        self.assertIn("adapter=promptfoo", output)
+        invoked_argv = subprocess_run.call_args.args[0]
+        self.assertIn("promptfoo", invoked_argv)
+        self.assertNotIn("inspect-ai", invoked_argv)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture", return_value=(0, "out", ""))
+    def test_eval_adapter_flag_forces_harness(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # Both adapter configs present; --adapter harness must bypass them.
+            (root / "inspect.yaml").write_text("tasks: []\n", encoding="utf-8")
+            (root / "promptfooconfig.yaml").write_text(
+                "providers: []\n", encoding="utf-8"
+            )
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a"}\n', encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    [
+                        "eval",
+                        "--adapter",
+                        "harness",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--out",
+                        "artifacts/evals/forced-harness.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "forced-harness.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(report["adapter"], "harness")
+        run_capture.assert_called_once()
+
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_normalizes_inspect_results(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        fake_log = {
+            "eval": {"model": "anthropic/claude-4-7-sonnet", "task": "theory"},
+            "results": {"total_samples": 3, "completed_samples": 3},
+            "samples": [
+                {
+                    "id": 1,
+                    "input": "case-1",
+                    "output": {"completion": "answer-1", "time": 0.042},
+                    "scores": {"accuracy": {"value": "C"}},
+                    "total_time": 0.05,
+                },
+                {
+                    "id": 2,
+                    "input": [
+                        {"role": "user", "content": "case-2-msg"},
+                    ],
+                    "output": {
+                        "choices": [
+                            {"message": {"content": "answer-2"}}
+                        ]
+                    },
+                    "scores": {"accuracy": {"value": "I"}},
+                },
+                {
+                    "id": 3,
+                    "input": "case-3",
+                    "output": {"completion": "ok"},
+                    "scores": {"custom_scorer": {"value": 0.9}},
+                },
+            ],
+        }
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            log_dir = Path(argv[argv.index("--log-dir") + 1])
+            self._write_inspect_log(log_dir, fake_log)
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "inspect.yaml").write_text("tasks: []\n", encoding="utf-8")
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["eval", "--out", "artifacts/evals/inspect-norm.json"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "inspect-norm.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        # 2/3 passing => adapter run exits non-zero to flag partial failure.
+        self.assertEqual(code, 1)
+        self.assertEqual(report["schema"], "vex-eval/v1")
+        self.assertEqual(report["adapter"], "inspect")
+        self.assertEqual(report["passed"], 2)
+        self.assertEqual(report["failed"], 1)
+        self.assertAlmostEqual(report["pass_rate"], 66.67, places=2)
+        self.assertEqual(len(report["results"]), 3)
+        self.assertEqual(report["results"][0]["input"], "case-1")
+        self.assertEqual(report["results"][0]["output"], "answer-1")
+        self.assertEqual(
+            report["results"][0]["provider"], "anthropic/claude-4-7-sonnet"
+        )
+        # ``total_time`` = 0.05s wins over ``output.time`` and becomes 50ms.
+        self.assertEqual(report["results"][0]["latency_ms"], 50.0)
+        self.assertTrue(report["results"][0]["passed"])
+        self.assertEqual(report["results"][1]["output"], "answer-2")
+        self.assertEqual(report["results"][1]["input"], "case-2-msg")
+        self.assertFalse(report["results"][1]["passed"])
+        self.assertTrue(report["results"][2]["passed"])
+        self.assertEqual(report["results"][2]["score"], 0.9)
+
+    def test_eval_no_promptfoo_flag_still_works_with_deprecation_warning(
+        self,
+    ) -> None:
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        from unittest.mock import patch as _patch
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "promptfooconfig.yaml").write_text(
+                "providers: []\n", encoding="utf-8"
+            )
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a"}\n', encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                with (
+                    _patch("vex.cli.uv_bin", return_value="uv"),
+                    _patch("vex.cli.run_command_capture", return_value=(0, "out", "")),
+                    contextlib.redirect_stdout(stdout_buf),
+                    contextlib.redirect_stderr(stderr_buf),
+                ):
+                    from vex.cli import main
+
+                    code = main(
+                        [
+                            "eval",
+                            "--no-promptfoo",
+                            "--per-case",
+                            "--command",
+                            "echo {input}",
+                            "--out",
+                            "artifacts/evals/deprecated.json",
+                        ]
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "deprecated.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(report["adapter"], "harness")
+        self.assertIn("--no-promptfoo is deprecated", stderr_buf.getvalue())
+
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_adapter_auto_prefers_inspect_over_promptfoo(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            # Only Inspect's argv shape includes --log-dir.
+            log_dir = Path(argv[argv.index("--log-dir") + 1])
+            self._write_inspect_log(
+                log_dir,
+                {
+                    "eval": {"model": "anthropic/claude-4-7-sonnet"},
+                    "results": {"total_samples": 1, "completed_samples": 1},
+                    "samples": [
+                        {
+                            "id": 1,
+                            "input": "q",
+                            "output": {"completion": "a"},
+                            "scores": {"accuracy": {"value": "C"}},
+                        }
+                    ],
+                },
+            )
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "inspect.yaml").write_text("tasks: []\n", encoding="utf-8")
+            (root / "promptfooconfig.yaml").write_text(
+                "providers: []\n", encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    ["eval", "--out", "artifacts/evals/auto.json"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "auto.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("adapter=inspect", output)
+        self.assertEqual(report["adapter"], "inspect")
+        invoked_argv = subprocess_run.call_args.args[0]
+        # Confirm we never ran promptfoo.
+        self.assertNotIn("promptfoo", invoked_argv)
+        self.assertIn("inspect-ai", invoked_argv)
 
     @patch("vex.cli.uv_bin", return_value="uv")
     @patch("vex.cli.run_command_capture")
