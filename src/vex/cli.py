@@ -53,6 +53,10 @@ DEFAULT_SCRIPT_COMMANDS = {
 
 PASSTHROUGH_COMMANDS = {"run", "test", "lint", "format", "typecheck", "dev"}
 AI_TEMPLATES = {"agent", "inference-api"}
+# Python floor used by scaffolded projects when the user does not pass --python.
+# Kept conservative so fresh projects stay portable across common developer machines.
+DEFAULT_SCAFFOLD_PYTHON = "3.12"
+DEFAULT_SCAFFOLD_REQUIRES_PYTHON = ">=3.11"
 VEX_MODEL_SCHEMA_VERSION = "v1"
 VEX_RUNTIME_NAME = "vex-ai-runtime"
 VEX_MODEL_SCHEMA_ID = "vex-model/v1"
@@ -742,8 +746,15 @@ def init_project_dir(path_arg: str | None) -> Path:
     return project_root()
 
 
-def build_init_args(args: argparse.Namespace, init_path: str | None) -> tuple[list[str], Path, bool]:
-    package_mode = bool(args.lib)
+def build_init_args(
+    args: argparse.Namespace,
+    init_path: str | None,
+    template: str | None = None,
+) -> tuple[list[str], Path, bool]:
+    # Agent / inference-api templates install as editable packages so their
+    # scaffolded `python -m <pkg>.main` dev commands resolve without PYTHONPATH.
+    ai_template = template in AI_TEMPLATES
+    package_mode = bool(args.lib) or ai_template
     uv_args = ["init"]
 
     if init_path:
@@ -752,15 +763,54 @@ def build_init_args(args: argparse.Namespace, init_path: str | None) -> tuple[li
         uv_args.extend(["--name", args.name])
     if args.python:
         uv_args.extend(["--python", args.python])
+    else:
+        # Avoid inheriting whatever Python is newest on the scaffolder's
+        # machine (e.g. 3.14) which makes the generated project unusable on
+        # typical developer machines. The floor is normalized again post-init.
+        uv_args.extend(["--python", DEFAULT_SCAFFOLD_PYTHON])
 
     uv_args.extend(["--vcs", "none", "--no-workspace"])
 
     if args.lib:
         uv_args.extend(["--lib", "--package", "--build-backend", "hatch"])
+    elif ai_template:
+        uv_args.extend(["--package", "--build-backend", "hatch"])
     else:
         uv_args.extend(["--app", "--no-package"])
 
     return uv_args, init_project_dir(init_path), package_mode
+
+
+def normalize_python_pin(root: Path, requested: str | None) -> None:
+    """Pin scaffolded projects to a portable Python floor.
+
+    `uv init` inherits the newest interpreter available on the scaffolder's
+    machine, which produces unusable `requires-python` pins (e.g. `>=3.14`)
+    when the user did not explicitly request a version. Rewrite both the
+    pyproject constraint and `.python-version` to stable defaults when the
+    user did not pass `--python`.
+    """
+    if requested:
+        return
+
+    pyproject_path = root / "pyproject.toml"
+    if pyproject_path.exists():
+        content = pyproject_path.read_text(encoding="utf-8")
+        new_content = re.sub(
+            r'^requires-python\s*=\s*"[^"]*"',
+            f'requires-python = "{DEFAULT_SCAFFOLD_REQUIRES_PYTHON}"',
+            content,
+            count=1,
+            flags=re.MULTILINE,
+        )
+        if new_content != content:
+            pyproject_path.write_text(new_content, encoding="utf-8")
+
+    python_version_path = root / ".python-version"
+    if python_version_path.exists():
+        python_version_path.write_text(
+            f"{DEFAULT_SCAFFOLD_PYTHON}\n", encoding="utf-8"
+        )
 
 
 def write_file(path: Path, content: str) -> None:
@@ -2384,9 +2434,10 @@ def handle_init(args: argparse.Namespace) -> int:
         print(str(exc))
         return 2
 
-    uv_args, root, package_mode = build_init_args(args, init_path)
+    uv_args, root, package_mode = build_init_args(args, init_path, template=template)
     code = run_uv(uv_args)
     if code == 0:
+        normalize_python_pin(root, args.python)
         package_name = default_package_name(root, args.name)
         append_vex_config(root, package_mode=package_mode, template=template, package_name=package_name)
         scaffold_ai_template(root, template=template, package_name=package_name)
