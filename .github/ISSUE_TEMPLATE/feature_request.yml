@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a new capability for vex or vex-ai-runtime
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - vex CLI/workflow
+        - engine/vex-ai-runtime
+        - shared schema contract
+        - docs
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      placeholder: What pain are we solving?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: What should we build?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: success
+    attributes:
+      label: Success criteria
+      placeholder: How will we know this is done?
