@@ -434,12 +434,190 @@ def doctor_checks(root: Path, scope: str | None = None) -> tuple[int, list[str]]
                 lines.append("WARN no sandbox backend detected (install docker or podman)")
             else:
                 lines.append(f"OK  sandbox backend detected: {backend}")
+                image = str(policy.get("sandbox_image", "python:3.12-slim"))
+                cached = sandbox_image_cached(backend, image)
+                if cached is True:
+                    lines.append(f"OK  sandbox image cached locally: {image}")
+                elif cached is False:
+                    lines.append(
+                        f"WARN sandbox image not cached locally: {image} "
+                        f"(run: {backend} pull {image})"
+                    )
+
+        issues += _append_ai_provider_checks(root, lines)
+        issues += _append_eval_dataset_checks(root, lines)
+        issues += _append_deploy_env_checks(root, lines)
 
         drift = schema_drift_warning(root)
         if drift:
             lines.append(drift)
 
     return issues, lines
+
+
+def sandbox_image_cached(backend: str, image: str) -> bool | None:
+    if backend not in {"docker", "podman"} or not shutil.which(backend):
+        return None
+    try:
+        result = subprocess.run(
+            [backend, "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.returncode == 0
+
+
+_HOSTED_PROVIDER_KEYS: tuple[tuple[str, str], ...] = (
+    ("OPENAI_API_KEY", "openai"),
+    ("ANTHROPIC_API_KEY", "anthropic"),
+    ("GOOGLE_API_KEY", "google"),
+    ("GROQ_API_KEY", "groq"),
+)
+
+
+def _append_ai_provider_checks(root: Path, lines: list[str]) -> int:
+    issues = 0
+
+    found_keys = [(env, name) for env, name in _HOSTED_PROVIDER_KEYS if os.environ.get(env)]
+    for env, name in found_keys:
+        value = os.environ.get(env, "")
+        if env == "OPENAI_API_KEY" and value and not value.startswith(("sk-", "ollama")):
+            lines.append(f"WARN {env} set but does not start with 'sk-' (looks malformed)")
+            issues += 1
+        elif env == "ANTHROPIC_API_KEY" and value and not value.startswith("sk-ant-"):
+            lines.append(f"WARN {env} set but does not start with 'sk-ant-' (looks malformed)")
+            issues += 1
+        else:
+            lines.append(f"OK  hosted provider credential detected: {name} ({env})")
+
+    ollama_on_path = shutil.which("ollama") is not None
+    if not found_keys:
+        if ollama_on_path:
+            lines.append("OK  no hosted provider keys; ollama available on PATH (local fallback)")
+        else:
+            lines.append(
+                "WARN no hosted provider keys set and 'ollama' not on PATH "
+                "(install ollama or set OPENAI_API_KEY / ANTHROPIC_API_KEY)"
+            )
+            issues += 1
+    else:
+        if ollama_on_path:
+            lines.append("OK  ollama available on PATH (local fallback)")
+
+    env_example = root / ".env.example"
+    if env_example.exists():
+        declared: list[str] = []
+        for line in env_example.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip().lstrip("#").strip()
+            if not stripped or "=" not in stripped:
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key and key.isupper():
+                declared.append(key)
+        expected_provider_keys = [k for k in declared if k.endswith("_API_KEY")]
+        missing = [
+            k for k in expected_provider_keys
+            if not os.environ.get(k) and not any(k == env for env, _ in _HOSTED_PROVIDER_KEYS if os.environ.get(env))
+        ]
+        all_missing = all(not os.environ.get(k) for k in expected_provider_keys)
+        if expected_provider_keys and all_missing and not ollama_on_path:
+            lines.append(
+                f"WARN .env.example declares {len(expected_provider_keys)} provider key(s) "
+                f"but none are set in the environment"
+            )
+            issues += 1
+        elif expected_provider_keys and all_missing:
+            lines.append(
+                f"OK  .env.example declares {len(expected_provider_keys)} provider key(s); "
+                f"none set — will use ollama fallback"
+            )
+
+    return issues
+
+
+def _append_eval_dataset_checks(root: Path, lines: list[str]) -> int:
+    issues = 0
+    datasets_dir = root / "evals" / "datasets"
+    if not datasets_dir.exists():
+        return issues
+
+    dataset_files = sorted(p for p in datasets_dir.glob("*.jsonl") if p.is_file())
+    if not dataset_files:
+        lines.append("WARN evals/datasets/ present but no .jsonl datasets found")
+        return issues
+
+    for dataset in dataset_files:
+        rel = dataset.relative_to(root)
+        try:
+            raw_lines = dataset.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            lines.append(f"WARN could not read {rel}: {exc}")
+            issues += 1
+            continue
+
+        non_empty = [line for line in raw_lines if line.strip()]
+        if not non_empty:
+            lines.append(f"WARN {rel} has no cases")
+            issues += 1
+            continue
+
+        bad_rows = 0
+        missing_input = 0
+        for raw in non_empty:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                bad_rows += 1
+                continue
+            if not isinstance(parsed, dict) or "input" not in parsed:
+                missing_input += 1
+
+        if bad_rows or missing_input:
+            lines.append(
+                f"WARN {rel}: {len(non_empty)} rows, {bad_rows} invalid JSON, "
+                f"{missing_input} missing 'input' field"
+            )
+            issues += 1
+        else:
+            lines.append(f"OK  eval dataset {rel}: {len(non_empty)} cases valid")
+
+    return issues
+
+
+_ENV_INTERP_PATTERN = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+
+
+def _append_deploy_env_checks(root: Path, lines: list[str]) -> int:
+    issues = 0
+    targets_path = root / "deploy.targets.toml"
+    if not targets_path.exists():
+        return issues
+
+    try:
+        raw = targets_path.read_text(encoding="utf-8")
+    except OSError:
+        return issues
+
+    referenced = sorted(set(_ENV_INTERP_PATTERN.findall(raw)))
+    if not referenced:
+        return issues
+
+    unbound = [name for name in referenced if not os.environ.get(name)]
+    if unbound:
+        lines.append(
+            f"WARN deploy.targets.toml references unbound env vars: {', '.join(unbound)}"
+        )
+        issues += 1
+    else:
+        lines.append(
+            f"OK  deploy.targets.toml env vars bound ({len(referenced)} referenced)"
+        )
+
+    return issues
 
 
 def default_package_name(root: Path, explicit_name: str | None) -> str:
