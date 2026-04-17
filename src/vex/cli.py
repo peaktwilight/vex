@@ -1221,6 +1221,88 @@ def scaffold_modal(root: Path, app_name: str) -> Path:
     return path
 
 
+def detect_gcloud_project() -> str | None:
+    if shutil.which("gcloud") is None:
+        return None
+    code, stdout, _stderr = run_command_capture(["gcloud", "config", "get-value", "project"]) 
+    if code != 0:
+        return None
+    value = stdout.strip()
+    if not value or value == "(unset)":
+        return None
+    return value
+
+
+def deploy_preflight(root: Path, target: str, profile: dict[str, Any]) -> tuple[int, list[str]]:
+    issues = 0
+    lines: list[str] = []
+
+    if uv_bin():
+        lines.append("OK  uv available")
+    else:
+        issues += 1
+        lines.append("WARN uv not found on PATH")
+
+    image = str(profile.get("image", "vex-app"))
+    tag = str(profile.get("tag", "latest"))
+    lines.append(f"OK  profile image={image}:{tag}")
+
+    targets = [target]
+    if target == "all":
+        targets = ["docker", "cloud-run", "modal"]
+
+    for item in targets:
+        if item == "docker":
+            tool = docker_like_bin()
+            if tool:
+                lines.append(f"OK  docker-compatible CLI found: {tool}")
+            else:
+                issues += 1
+                lines.append("WARN docker/podman not found")
+
+        if item == "cloud-run":
+            if shutil.which("gcloud"):
+                lines.append("OK  gcloud CLI found")
+            else:
+                issues += 1
+                lines.append("WARN gcloud CLI not found")
+
+            project = os.environ.get("GOOGLE_CLOUD_PROJECT") or detect_gcloud_project()
+            if project:
+                lines.append(f"OK  Google Cloud project configured: {project}")
+            else:
+                issues += 1
+                lines.append("WARN Google Cloud project not configured")
+
+        if item == "modal":
+            if shutil.which("modal"):
+                lines.append("OK  modal CLI found")
+            else:
+                issues += 1
+                lines.append("WARN modal CLI not found")
+
+            token_id = os.environ.get("MODAL_TOKEN_ID")
+            token_secret = os.environ.get("MODAL_TOKEN_SECRET")
+            if token_id and token_secret:
+                lines.append("OK  Modal token env vars present")
+            else:
+                lines.append("WARN Modal token env vars missing (MODAL_TOKEN_ID/MODAL_TOKEN_SECRET)")
+
+    runtime_root = resolve_runtime_root(root)
+    if runtime_root is not None:
+        lines.append(f"OK  runtime root detected: {runtime_root}")
+    else:
+        lines.append("WARN runtime root not detected; set VEX_AI_RUNTIME_PATH if needed")
+
+    deploy_targets = root / "deploy.targets.toml"
+    if deploy_targets.exists():
+        lines.append("OK  deploy.targets.toml present")
+    else:
+        lines.append("WARN deploy.targets.toml not found")
+
+    return issues, lines
+
+
 def runtime_compatibility_check(root: Path, artifact_dir: Path) -> tuple[bool, str]:
     runtime_root = resolve_runtime_root(root)
     if runtime_root is None:
@@ -1318,7 +1400,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.set_defaults(handler=handle_eval)
 
     deploy_parser = subparsers.add_parser("deploy", help=COMMAND_HELP["deploy"])
-    deploy_parser.add_argument("target", choices=["docker", "cloud-run", "modal"])
+    deploy_parser.add_argument("target", choices=["docker", "cloud-run", "modal", "check"])
     deploy_parser.add_argument("--image", default="vex-app")
     deploy_parser.add_argument("--tag", default="latest")
     deploy_parser.add_argument("--push", action="store_true")
@@ -1328,6 +1410,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--apply", action="store_true")
     deploy_parser.add_argument("--run", action="store_true")
     deploy_parser.add_argument("--profile", default="default")
+    deploy_parser.add_argument("--for", dest="check_target", choices=["all", "docker", "cloud-run", "modal"], default="all")
     deploy_parser.set_defaults(handler=handle_deploy)
 
     policy_parser = subparsers.add_parser("policy", help=COMMAND_HELP["policy"])
@@ -1628,6 +1711,12 @@ def handle_deploy(args: argparse.Namespace) -> int:
     region = str(profile.get("region", args.region))
     app_name = str(profile.get("app_name", args.app_name))
     push = bool(profile.get("push", args.push))
+
+    if args.target == "check":
+        issues, lines = deploy_preflight(root, target=args.check_target, profile=profile)
+        for line in lines:
+            print(line)
+        return 0 if issues == 0 else 1
 
     if args.target == "docker":
         return deploy_docker(root, image=image, tag=tag, push=push)

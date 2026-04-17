@@ -30,6 +30,7 @@ These commands are useful bootstrap plumbing because they let `vex` ride on top 
 - `vex policy`
 - `vex package-model`
 - `vex deploy`
+- `vex deploy check`
 - `vex schema validate-model`
 - `vex run --sandbox`
 - `vex doctor ai`
