@@ -171,6 +171,9 @@ class CliTests(unittest.TestCase):
         self.assertIn('eval = "python -m pytest -q"', pyproject_text)
 
     def test_init_agent_creates_template_files(self) -> None:
+        import ast
+        import json as _json
+
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             os.chdir(temp_dir)
@@ -180,12 +183,17 @@ class CliTests(unittest.TestCase):
                 os.chdir(original_cwd)
 
             root = Path(temp_dir) / "support-agent"
+            pkg = root / "src" / "support_agent"
             pyproject_text = (root / "pyproject.toml").read_text(encoding="utf-8")
-            has_main = (root / "src" / "support_agent" / "main.py").exists()
-            has_eval = (root / "src" / "support_agent" / "eval.py").exists()
+            agent_src = (pkg / "agent.py").read_text(encoding="utf-8")
+            settings_src = (pkg / "settings.py").read_text(encoding="utf-8")
+            main_src = (pkg / "main.py").read_text(encoding="utf-8")
+            eval_src = (pkg / "eval.py").read_text(encoding="utf-8")
+            env_example = (root / ".env.example").read_text(encoding="utf-8")
+            cases_text = (root / "evals" / "datasets" / "cases.jsonl").read_text(encoding="utf-8")
+
             has_prompt = (root / "prompts" / "system.md").exists()
             has_dataset = (root / "evals" / "datasets" / ".gitkeep").exists()
-            has_cases = (root / "evals" / "datasets" / "cases.jsonl").exists()
             has_eval_runner = (root / "evals" / "run_eval.py").exists()
             has_deploy_targets = (root / "deploy.targets.toml").exists()
 
@@ -197,12 +205,35 @@ class CliTests(unittest.TestCase):
         self.assertIn('[project.optional-dependencies]', pyproject_text)
         self.assertIn('"pydantic-ai>=0.0.0"', pyproject_text)
         self.assertTrue(has_deploy_targets)
-        self.assertTrue(has_main)
-        self.assertTrue(has_eval)
         self.assertTrue(has_prompt)
         self.assertTrue(has_dataset)
-        self.assertTrue(has_cases)
         self.assertTrue(has_eval_runner)
+
+        self.assertIn("from pydantic_ai import Agent", agent_src)
+        self.assertIn("@agent.tool", agent_src)
+        self.assertIn("lookup_faq", agent_src)
+        self.assertIn("BaseSettings", settings_src)
+        self.assertIn("resolve_provider", settings_src)
+        self.assertIn("ollama", settings_src)
+        self.assertIn("build_agent", main_src)
+        self.assertIn("asyncio.run", eval_src)
+        self.assertIn("OPENAI_API_KEY", env_example)
+        self.assertIn("VEX_OLLAMA_MODEL", env_example)
+
+        for name, source in [
+            ("agent.py", agent_src),
+            ("settings.py", settings_src),
+            ("main.py", main_src),
+            ("eval.py", eval_src),
+        ]:
+            with self.subTest(file=name):
+                ast.parse(source)
+
+        case_lines = [line for line in cases_text.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(case_lines), 3)
+        for line in case_lines:
+            parsed = _json.loads(line)
+            self.assertIn("input", parsed)
 
     def test_init_inference_api_creates_template_files(self) -> None:
         original_cwd = os.getcwd()
@@ -510,6 +541,28 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("unsafe local execution", output)
         run_command.assert_called_once_with(["sh", "-c", "echo hello"], cwd=root.resolve())
+
+    @patch("vex.cli.run_command", return_value=0)
+    def test_run_sandbox_preserves_single_quoted_shell_string(self, run_command: object) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                "unsafe_fallback = true\n"
+                'sandbox_backend = "none"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(["run", "--sandbox", "echo hi"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        run_command.assert_called_once_with(["sh", "-c", "echo hi"], cwd=root.resolve())
 
     def test_package_model_writes_manifest(self) -> None:
         original_cwd = os.getcwd()
