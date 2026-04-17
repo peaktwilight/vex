@@ -35,6 +35,30 @@ Run only runtime tests:
 make test-runtime
 ```
 
+## Running tests
+
+The vex CLI test suite is written as `unittest.TestCase` classes so it can be
+driven by either runner. Pick whichever is convenient:
+
+```bash
+# Stdlib unittest (no extra deps required)
+python -m unittest discover -s tests
+
+# Pytest (runs the same unittest classes plus anything marker-selected)
+pytest tests/
+
+# Integration tests: opt-in, shell out to real `uv`, ~1-2 minutes locally
+pytest tests/integration -m integration
+# or
+VEX_RUN_INTEGRATION=1 pytest tests/integration -m integration
+```
+
+Integration tests are excluded from the default `pytest tests/` run via the
+`addopts` config in `pyproject.toml` — they require `uv` on `PATH` and are
+gated behind the `integration` marker plus the `VEX_RUN_INTEGRATION=1`
+environment variable to avoid surprising contributors with a multi-minute
+scaffold+sync during a quick unit loop.
+
 ## Architecture Boundary
 
 Keep this separation clear:

@@ -13,8 +13,23 @@ dev = [
   "ruff>=0.6",
 ]
 
+[dependency-groups]
+test = [
+  "pytest>=8.0",
+]
+
 [project.scripts]
 vex = "vex.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests are opt-in. They are excluded from default `pytest tests/`
+# runs and must be selected explicitly with `-m integration` (or by setting
+# VEX_RUN_INTEGRATION=1 in CI).
+addopts = "-m 'not integration'"
+markers = [
+  "integration: end-to-end tests that shell out to uv and the real scaffold (deselect with -m 'not integration')",
+]
 
 [tool.vex]
 managed = true
