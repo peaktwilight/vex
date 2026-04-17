@@ -1,48 +1,56 @@
 # vex
 
-**The missing AI workflow layer for Python.** Four commands take you from an empty directory to a deployed, evaluated agent.
+**vex is the only Python agent CLI with a portable execution contract.**
 
-```bash
-vex init agent support-bot   # real PydanticAI agent, settings, eval, deploy profiles
-vex dev                      # hot reload + local model fallback + trace tail
-vex eval                     # pass/fail over your dataset, CI-ready exit codes
-vex deploy modal             # ships it
+Declare what your agent is allowed to do in `pyproject.toml`, then run, evaluate, and ship it under that same contract.
+
+```toml
+# pyproject.toml
+[tool.vex.policy]
+sandbox           = true
+network           = "deny"
+filesystem        = "project"
+sandbox_backend   = "auto"       # podman | docker | auto
+sandbox_memory_mb = 1024
+sandbox_pids_limit = 128
+unsafe_fallback   = false
 ```
 
-One CLI. One `pyproject.toml`. No yaml sprawl, no duct-taped stack. `vex` rides on top of `uv` and composes the tools you were going to reach for anyway.
+```bash
+vex run --sandbox python -m support_bot     # runs under cap-drop ALL, network none, read-only rootfs
+vex policy list                             # prints the effective contract
+```
+
+`vex deploy` is the same contract, pointed at Modal / Cloud Run / Docker. `vex eval` is the same contract, pointed at a dataset. The policy that makes the agent safe in production is the policy your evals already ran under — one artifact, three execution surfaces.
+
+Near-future: `vex eval --policy` will run every eval case inside the sandbox defined by `[tool.vex.policy]`, and `vex deploy --policy-gate` will refuse to ship an agent whose declared tool surface exceeds its policy budget. Enforcement is shipped today via `vex run --sandbox`; the eval and deploy gates are on the roadmap below.
+
+## Not another `langgraph new`
+
+LangGraph CLI ships `langgraph new → langgraph dev → langgraph deploy`. Modal CLI ships `modal serve → modal deploy`. Both are good. Neither treats the agent's execution policy as a portable first-class artifact.
+
+`vex` does. `[tool.vex.policy]` is declared once and re-expressed as the deploy target's native primitive: Modal sandbox config on Modal, IAM + VPC egress on Cloud Run, `--cap-drop` + `--network none` on a local container. Same contract, different substrate. You get the LangGraph-style workflow on top, but the policy is the headline — not the four commands.
 
 ---
 
-## Why vex
-
-Python AI apps are a duct-taped stack. You install PydanticAI by hand, bolt on promptfoo, hand-roll a Dockerfile, wire up ollama somewhere, and your eval harness is three scripts glued together. `uv` already owns packaging. Nothing owns the workflow.
-
-`vex` is the workflow. It is explicitly **not** a new resolver, lockfile, or runtime (see [`docs/architecture.md`](docs/architecture.md#non-goals)). It composes:
-
-- [`uv`](https://docs.astral.sh/uv/) — envs, deps, lockfile, Python versions
-- [PydanticAI](https://ai.pydantic.dev) + [`pydantic-settings`](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) — typed agents and config
-- [`ollama`](https://ollama.com) — local-first model fallback when no API key is set
-- [`promptfoo`](https://www.promptfoo.dev) / [`deepeval`](https://www.deepeval.com) — evals you can gate CI on
-- [`vex-ai-runtime`](engine/vex-ai-runtime/) — native execution and signed model artifacts
-- Docker / Cloud Run / Modal — deploy targets that already work
-
-## Install
+## The workflow that makes the contract observable
 
 ```bash
-uv tool install vex          # recommended
-# or run straight from the repo:
-PYTHONPATH=src python3 -m vex --help
+vex init agent support-bot   # scaffolds a PydanticAI agent under a default policy
+vex dev                      # watchfiles reload + provider banner + ollama fallback
+vex eval                     # PASS/FAIL over your dataset, CI-ready exit codes
+vex deploy modal             # ships it (preflight runs automatically)
 ```
 
-`vex` requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
+One CLI. One `pyproject.toml`. No yaml sprawl. `vex` rides on top of `uv` and composes the tools you were going to reach for anyway.
 
 ## How it composes
 
 ```
   pyproject.toml            (single source of truth)
         │
-        ├── [tool.vex.scripts]      dev / benchmark / eval / test / lint / format / typecheck
         ├── [tool.vex.policy]       sandbox / network / filesystem / memory / pids
+        ├── [tool.vex.scripts]      dev / benchmark / eval / test / lint / format / typecheck
         ├── [tool.vex.ai]           template / runtime selection
         └── [project.optional-dependencies]   agent / api / eval extras
         │
@@ -55,24 +63,50 @@ PYTHONPATH=src python3 -m vex --help
 
 Every verb is a thin wrapper. Escape hatches everywhere — if you want `uv run foo` directly, go do it.
 
+## Works on a plane
+
+`vex dev` does not require an API key, a LangSmith account, or a Modal account to get running:
+
+- `uv` handles Python install, venv, and deps — nothing Python-specific to set up
+- No `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` set? The scaffolded agent falls back to a local [`ollama`](https://ollama.com) model with no code changes
+- The sandbox runs against a local `podman` or `docker` daemon — no cloud round-trip
+
+Compared side by side: LangGraph Platform wants LangSmith auth to get the full dev loop; Modal needs a `modal.com` account before `modal serve` does anything. `vex dev` wants `uv` on your `$PATH`.
+
+## Install
+
+```bash
+uv tool install vex          # recommended
+# or run straight from the repo:
+PYTHONPATH=src python3 -m vex --help
+```
+
+`vex` requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
+
 ## What works today
 
-- `vex init agent <path>` — scaffolds a real PydanticAI agent: `agent.py` with a tool, `settings.py` with provider auto-resolution (openai / anthropic / ollama), `main.py` async entrypoint, `eval.py` with PASS/FAIL reporting, five seed eval cases, `prompts/system.md`, `.env.example`, `deploy.targets.toml` with `default` and `prod` profiles
-- `vex init inference-api <path>` — FastAPI + uvicorn + typed schemas
-- `vex benchmark --command ... --runs ... --warmup ...` — harness with warmup control and JSON output
-- `vex eval --command ...` and `vex eval --per-case --command "... {input} ..."` — dataset-driven checks
-- `vex eval` auto-delegates to [`promptfoo`](https://www.promptfoo.dev) via `uvx` when `promptfooconfig.yaml` is present. Use `--no-promptfoo` to force the built-in harness, `--json` for machine-readable output, and `--min-pass-rate 0.9` to gate CI on a fraction of passing cases. Override defaults in `[tool.vex.eval]` (`adapter = "auto"|"promptfoo"|"harness"`, `min_pass_rate = 0.9`).
+Policy and sandbox (the contract):
+
 - `vex policy list|get|set|unset` — inspect and override `[tool.vex.policy]`
 - `vex run --sandbox ...` — Docker/Podman-backed execution with `--cap-drop ALL`, `--network none`, read-only rootfs, memory + pids caps
+
+Eval / deploy / doctor / init:
+
+- `vex eval --command ...` and `vex eval --per-case --command "... {input} ..."` — dataset-driven checks
+- `vex eval` auto-delegates to [`promptfoo`](https://www.promptfoo.dev) via `uvx` when `promptfooconfig.yaml` is present. Use `--no-promptfoo` to force the built-in harness, `--json` for machine-readable output, and `--min-pass-rate 0.9` to gate CI on a fraction of passing cases. Override defaults in `[tool.vex.eval]` (`adapter = "auto"|"promptfoo"|"harness"`, `min_pass_rate = 0.9`)
+- `vex deploy docker|cloud-run|modal [--apply|--run]` — scaffold + ship end-to-end; `docker --run` builds and runs locally, `cloud-run --apply` runs `gcloud builds submit` then `gcloud run deploy` and echoes the service URL, `modal --run` invokes `modal deploy` and surfaces the `*.modal.run` URL. Profile inheritance (`inherit = "default"`), env interpolation (`${VEX_IMAGE_REPO}`), and Cloud Run profile fields (`project`, `memory`, `cpu`, `min_instances`, `max_instances`, `service_account`, `allow_unauthenticated`). Preflight runs automatically on `--apply`/`--run` (override with `--skip-preflight`)
+- `vex deploy check [--for all|docker|cloud-run|modal]` — preflight
+- `vex doctor ai` — readiness report (uv, pyproject, policy, provider env, ollama reachability, eval dataset shape, deploy profile env vars)
+- `vex init agent <path>` — scaffolds a real PydanticAI agent: `agent.py` with a tool, `settings.py` with provider auto-resolution (openai / anthropic / ollama), `main.py` async entrypoint, `eval.py` with PASS/FAIL reporting, five seed eval cases, `prompts/system.md`, `.env.example`, `deploy.targets.toml` with `default` and `prod` profiles
+- `vex init inference-api <path>` — FastAPI + uvicorn + typed schemas
+- `vex dev` — watchfiles reload + provider banner, with `--no-reload` / `--watch` / `--provider-check` flags
+- `vex benchmark --command ... --runs ... --warmup ...` — harness with warmup control and JSON output
 - `vex package-model <model.onnx>` — versioned manifest with compatibility metadata:
   ```json
   { "schema_version": "v1", "runtime": "vex-ai-runtime",
     "engine": "onnxruntime", "model_path": "models/model.onnx" }
   ```
-- `vex deploy docker|cloud-run|modal [--apply|--run]` — scaffold + ship end-to-end; `docker --run` builds and runs locally, `cloud-run --apply` runs `gcloud builds submit` then `gcloud run deploy` and echoes the service URL, `modal --run` invokes `modal deploy` and surfaces the `*.modal.run` URL. Profile inheritance (`inherit = "default"`), env interpolation (`${VEX_IMAGE_REPO}`), and Cloud Run profile fields (`project`, `memory`, `cpu`, `min_instances`, `max_instances`, `service_account`, `allow_unauthenticated`). Preflight runs automatically on `--apply`/`--run` (override with `--skip-preflight`).
-- `vex deploy check [--for all|docker|cloud-run|modal]` — preflight
 - `vex schema validate-model [artifact_dir]` — verify a packaged artifact
-- `vex doctor ai` — 13-check readiness report
 
 Every generic `uv` verb (`add`, `remove`, `sync`, `lock`, `build`, `publish`, `python`, `tool`, `run`, `test`, `lint`, `format`, `typecheck`) is also exposed as a thin passthrough so a vex project stays a normal Python project.
 
@@ -90,6 +124,18 @@ vex deploy check --for all
 
 No API key? `vex` falls back to a local [`ollama`](https://ollama.com) model — no code changes.
 
+## Where this is going
+
+The policy contract turns into a gate, not just a declaration:
+
+- `vex eval --policy` — run every eval case inside the `[tool.vex.policy]` sandbox, so a case that needs network egress fails the same way the deployed agent would
+- `vex deploy --policy-gate` — refuse to ship an agent whose declared tool surface exceeds its policy budget, and re-express the policy as the target's native primitive (Modal sandbox, Cloud Run IAM, Docker cap-drop)
+- Trace tail in `vex dev` — inline LLM / tool-call trace view during the reload loop
+- Inspect AI adapter as the default eval backend (see [issue #23](https://github.com/peaktwilight/vex/issues/23))
+- Logfire + OTel GenAI observability hook on scaffolded agents (see [issue #24](https://github.com/peaktwilight/vex/issues/24))
+
+See [`docs/roadmap.md`](docs/roadmap.md) and [`docs/product-boundary.md`](docs/product-boundary.md) for the longer view.
+
 ## Repository layout
 
 - `src/vex/` — CLI and workflow control plane
@@ -97,15 +143,6 @@ No API key? `vex` falls back to a local [`ollama`](https://ollama.com) model —
 - `tests/` — CLI test suite
 - `docs/` — architecture, product boundary, roadmap
 - `.github/workflows/` — CI for CLI + runtime
-
-## Where this is going
-
-The roadmap ([`docs/roadmap.md`](docs/roadmap.md)) and product boundary ([`docs/product-boundary.md`](docs/product-boundary.md)) spell it out:
-
-- `vex dev` upgraded to a real dev loop: [`watchfiles`](https://watchfiles.helpmanual.io) hot reload + local ollama fallback + inline trace tail
-- `vex eval` adapters for promptfoo and deepeval, with `--json` CI output and pass-rate gates
-- `vex doctor ai` extended to verify ollama availability, model reachability, eval dataset shape, deploy profile env vars
-- More opinionated `examples/` tree with runnable agents, inference APIs, and local RAG
 
 ## Design principles
 
@@ -130,4 +167,4 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full dev loop.
 
 ---
 
-vex is early. Expect sharp edges, missing polish, and a few commands that still read as bootstrap plumbing. The direction is firm: make the AI app path obvious, one composed workflow at a time.
+vex is early. Expect sharp edges, missing polish, and a few commands that still read as bootstrap plumbing. The direction is firm: give Python agents a portable execution contract, and make the four-command workflow a consequence of that contract, not a substitute for it.

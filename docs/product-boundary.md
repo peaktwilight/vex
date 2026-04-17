@@ -47,7 +47,9 @@ Those are already strong enough that competing there weakens the product story.
 - `uv` for package/env management
 - `ollama` for local model runtime where useful
 - agent frameworks like `PydanticAI` or `LangGraph`
-- eval tools like `promptfoo` or hosted observability platforms
+- eval tools like `Inspect AI` (intended default), `promptfoo`, or hosted
+  observability platforms
+- observability adapters like `Logfire` / OTel GenAI
 - deployment targets like Modal, BentoML, Baseten, or custom containers
 
 ## Recommended Domain Defaults (MVP)
@@ -57,11 +59,18 @@ Those are already strong enough that competing there weakens the product story.
 - **Scaffolding: inference-api**
   - `FastAPI` + `uvicorn` with typed schemas
 - **Benchmark and eval**
-  - Python-native harness first, then adapters for `deepeval` and `ragas`
+  - Inspect AI by default, promptfoo as opt-in adapter, Python harness as
+    fallback (see [`eval.md`](eval.md) for adapter precedence)
 - **Sandboxing**
   - container sandbox backend for local development, network denied by default
+    (see [`policy.md`](policy.md) for the full `[tool.vex.policy]` schema)
 - **Deployment adapters**
-  - Docker/OCI first, then Cloud Run and Modal as early managed targets
+  - Docker/OCI, Cloud Run, and Modal are all shipped with
+    `vex deploy <target> --apply|--run` (see [`deploy.md`](deploy.md) for
+    target-specific behavior and `deploy.targets.toml`)
+- **Observability**
+  - Logfire / OTel GenAI are the intended adapters so traces from
+    `vex dev` and production inference stay on a shared schema
 
 These defaults are intentionally pragmatic and local-first.
 
@@ -74,17 +83,23 @@ During rapid iteration, a monorepo is recommended:
 
 This keeps schema, packaging, and compatibility changes synchronized.
 
-Long term, the components can still be versioned and released independently. The product boundary stays the same even if source control topology changes.
+Long term, the components can still be versioned and released independently.
+The product boundary stays the same even if source control topology changes.
 
-## Recommended Command Direction
+## Command Surface
+
+AI-native workflow commands that give `vex` a story distinct from generic
+Python tooling:
 
 - `vex init agent`
 - `vex init inference-api`
 - `vex dev`
 - `vex benchmark`
-- `vex policy`
+- `vex eval` (see [`eval.md`](eval.md))
+- `vex policy` (see [`policy.md`](policy.md))
 - `vex package-model`
+- `vex deploy` (see [`deploy.md`](deploy.md))
+- `vex deploy check`
+- `vex schema validate-model`
 - `vex run --sandbox`
 - `vex doctor ai`
-
-These commands give `vex` a story that is distinct from generic Python tooling.
