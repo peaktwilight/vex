@@ -404,6 +404,8 @@ class CliTests(unittest.TestCase):
         self.assertIn('eval = "python evals/run_eval.py --input {input}"', pyproject_text)
         self.assertIn('[project.optional-dependencies]', pyproject_text)
         self.assertIn('"pydantic-ai>=0.0.0"', pyproject_text)
+        self.assertIn('observability = [', pyproject_text)
+        self.assertIn('"logfire>=3.0"', pyproject_text)
         self.assertTrue(has_deploy_targets)
         self.assertTrue(has_prompt)
         self.assertTrue(has_dataset)
@@ -416,9 +418,17 @@ class CliTests(unittest.TestCase):
         self.assertIn("resolve_provider", settings_src)
         self.assertIn("ollama", settings_src)
         self.assertIn("build_agent", main_src)
+        self.assertIn('if os.environ.get("LOGFIRE_TOKEN"):', main_src)
+        self.assertIn("import logfire", main_src)
+        self.assertIn("logfire.configure()", main_src)
+        self.assertIn("logfire.instrument_pydantic_ai()", main_src)
+        self.assertIn("except ImportError:", main_src)
         self.assertIn("asyncio.run", eval_src)
         self.assertIn("OPENAI_API_KEY", env_example)
         self.assertIn("VEX_OLLAMA_MODEL", env_example)
+        self.assertIn("LOGFIRE_TOKEN=pylf_v1_...", env_example)
+        self.assertIn("OTEL_EXPORTER_OTLP_ENDPOINT=", env_example)
+        self.assertIn("OTEL_EXPORTER_OTLP_HEADERS=", env_example)
 
         for name, source in [
             ("agent.py", agent_src),
@@ -689,6 +699,131 @@ class CliTests(unittest.TestCase):
         self.assertIn(
             "WARN deploy.targets.toml references unbound env vars: "
             "VEX_DEPLOY_REGION, VEX_IMAGE_REPO",
+            output,
+        )
+
+    @patch.dict(os.environ, {"LOGFIRE_TOKEN": "pylf_v1_fake"}, clear=True)
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_reports_observability_logfire(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("OK  observability: logfire", output)
+        self.assertNotIn("WARN no observability configured", output)
+
+    @patch.dict(
+        os.environ,
+        {"OTEL_EXPORTER_OTLP_ENDPOINT": "https://user:pass@collector.example.com:4318/v1/traces"},
+        clear=True,
+    )
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_reports_observability_otel(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("OK  observability: otel endpoint=collector.example.com:4318", output)
+        # Credentials and path must be stripped from the reported host.
+        self.assertNotIn("user:pass", output)
+        self.assertNotIn("/v1/traces", output)
+        self.assertNotIn("WARN no observability configured", output)
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-testkey"}, clear=True)
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_warns_no_observability_soft(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_root = root / "engine" / "vex-ai-runtime"
+            (runtime_root / "schemas").mkdir(parents=True)
+            (runtime_root / "schemas" / "vex-model-schema.json").write_text(
+                '{"schema":"vex-model/v1","schema_version":"v1","runtime":"vex-ai-runtime","engine":"onnxruntime"}\n',
+                encoding="utf-8",
+            )
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.env]\npath = \".venv\"\n\n"
+                "[tool.vex.scripts]\n"
+                'dev = "python -m demo.main"\n'
+                'benchmark = "python -m demo.benchmark"\n'
+                'eval = "python evals/run_eval.py --input {input}"\n'
+                'test = "pytest"\n\n'
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            (root / "deploy.targets.toml").write_text(
+                "[profiles.default]\n"
+                'image = "ghcr.io/example/demo"\n',
+                encoding="utf-8",
+            )
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            (root / ".venv").mkdir()
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        # Missing observability is a soft warning — must not cause non-zero exit
+        # (only the provider key is set, and all other AI checks are green).
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "WARN no observability configured "
+            "(set LOGFIRE_TOKEN or OTEL_EXPORTER_OTLP_ENDPOINT)",
             output,
         )
 

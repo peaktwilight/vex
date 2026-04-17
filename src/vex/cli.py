@@ -466,6 +466,7 @@ def doctor_checks(root: Path, scope: str | None = None) -> tuple[int, list[str]]
                     )
 
         issues += _append_ai_provider_checks(root, lines)
+        _append_observability_checks(lines)
         issues += _append_eval_dataset_checks(root, lines)
         issues += _append_deploy_env_checks(root, lines)
 
@@ -554,6 +555,48 @@ def _append_ai_provider_checks(root: Path, lines: list[str]) -> int:
             )
 
     return issues
+
+
+def _append_observability_checks(lines: list[str]) -> None:
+    """Report observability configuration (soft warn — observability is optional)."""
+    logfire_token = os.environ.get("LOGFIRE_TOKEN")
+    otel_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+    if logfire_token:
+        lines.append("OK  observability: logfire")
+        return
+
+    if otel_endpoint:
+        host = _otel_endpoint_host(otel_endpoint)
+        lines.append(f"OK  observability: otel endpoint={host}")
+        return
+
+    lines.append(
+        "WARN no observability configured "
+        "(set LOGFIRE_TOKEN or OTEL_EXPORTER_OTLP_ENDPOINT)"
+    )
+
+
+def _otel_endpoint_host(endpoint: str) -> str:
+    """Strip path and credentials from an OTLP endpoint URL, returning host[:port]."""
+    from urllib.parse import urlparse
+
+    raw = endpoint.strip()
+    parsed = urlparse(raw if "://" in raw else f"//{raw}", scheme="")
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    if not host:
+        # Fall back to stripping trailing path/query/fragment manually for values
+        # like "collector:4317" that urlparse may not decompose reliably.
+        cleaned = raw.split("?", 1)[0].split("#", 1)[0]
+        if "://" in cleaned:
+            cleaned = cleaned.split("://", 1)[1]
+        if "@" in cleaned:
+            cleaned = cleaned.split("@", 1)[1]
+        cleaned = cleaned.split("/", 1)[0]
+        host = cleaned
+    return host
 
 
 def _append_eval_dataset_checks(root: Path, lines: list[str]) -> int:
@@ -686,6 +729,9 @@ def append_vex_config(root: Path, package_mode: bool, template: str | None, pack
                 "eval = [\n"
                 "  \"deepeval>=0.21\",\n"
                 "  \"ragas>=0.2\",\n"
+                "]\n"
+                "observability = [\n"
+                "  \"logfire>=3.0\",\n"
                 "]\n"
             )
     if template == "inference-api":
@@ -904,7 +950,15 @@ def scaffold_agent_template(root: Path, package_name: str) -> None:
         (
             "from __future__ import annotations\n\n"
             "import asyncio\n"
+            "import os\n"
             "import sys\n\n"
+            "if os.environ.get(\"LOGFIRE_TOKEN\"):\n"
+            "    try:\n"
+            "        import logfire\n\n"
+            "        logfire.configure()\n"
+            "        logfire.instrument_pydantic_ai()\n"
+            "    except ImportError:\n"
+            "        pass\n\n"
             "from .agent import build_agent\n"
             "from .settings import Settings\n\n\n"
             "async def _run(prompt: str) -> str:\n"
@@ -1042,7 +1096,11 @@ def scaffold_agent_template(root: Path, package_name: str) -> None:
             "# VEX_OPENAI_MODEL=gpt-4o-mini\n"
             "# VEX_ANTHROPIC_MODEL=claude-3-5-sonnet-latest\n"
             "# VEX_OLLAMA_MODEL=llama3.2\n"
-            "# VEX_OLLAMA_BASE_URL=http://localhost:11434/v1\n"
+            "# VEX_OLLAMA_BASE_URL=http://localhost:11434/v1\n\n"
+            "# Observability (optional)\n"
+            "# LOGFIRE_TOKEN=pylf_v1_...\n"
+            "# OTEL_EXPORTER_OTLP_ENDPOINT=https://your-otel-collector\n"
+            "# OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20...\n"
         ),
     )
     write_file(
