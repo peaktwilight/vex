@@ -1,184 +1,133 @@
 # vex
 
-`vex` is an AI-native workflow tool for Python apps.
-
-The goal is not to replace `uv` or rebuild Python packaging. The goal is to make the AI app path obvious:
-
-- create an agent or inference project
-- run it locally with good defaults
-- benchmark it
-- package models and runtime assets
-- enforce execution policy and sandboxing
-- promote the app to real deployment targets
-
-`vex` should orchestrate mature tools rather than reimplement Python packaging from scratch.
-
-## Product Thesis
-
-Python already has strong building blocks like `uv`, `pytest`, `ruff`, and `hatchling`, and `uv` already owns the generic packaging substrate. `vex` should sit one layer higher and provide:
-
-- one local-first workflow for Python AI apps
-- one project model that treats prompts, models, evals, and policies as first-class
-- one place to switch between local runtimes and deployment targets
-- one place to define execution safety and runtime defaults
-- clear escape hatches to the underlying ecosystem, including `uv`
-
-## Initial Direction
-
-The current scaffold is a small `uv`-backed Python prototype. That remains useful as plumbing, but it is no longer the product thesis.
-
-Recommended product direction:
-
-- `uv` for Python installs, envs, resolution, locking, sync, build, publish, and tool execution
-- `vex-ai-runtime` for secure packaged inference execution
-- local runtimes like `ollama` where appropriate
-- eval and benchmark adapters rather than bespoke cloud infrastructure
-
-Recommended target commands:
-
-- `vex init agent`
-- `vex init inference-api`
-- `vex dev`
-- `vex benchmark`
-- `vex eval`
-- `vex policy`
-- `vex package-model`
-- `vex deploy`
-- `vex schema validate-model`
-- `vex run --sandbox`
-- `vex doctor ai`
-
-Current prototype commands still expose `uv`-adjacent wrappers. They should be treated as bootstrap functionality, not the long-term differentiator.
-
-## Dream Workflow
-
-The intended shape is closer to this:
+**The missing AI workflow layer for Python.** Four commands take you from an empty directory to a deployed, evaluated agent.
 
 ```bash
-vex init agent customer-support-agent
-vex dev
-vex benchmark
-vex eval --command "python -m app.eval"
-vex package-model models/encoder.onnx --out-dir dist/encoder
-vex deploy cloud-run --service customer-support-agent
-vex policy
-vex run --sandbox
+vex init agent support-bot   # real PydanticAI agent, settings, eval, deploy profiles
+vex dev                      # hot reload + local model fallback + trace tail
+vex eval                     # pass/fail over your dataset, CI-ready exit codes
+vex deploy modal             # ships it
 ```
 
-Under the hood:
+One CLI. One `pyproject.toml`. No yaml sprawl, no duct-taped stack. `vex` rides on top of `uv` and composes the tools you were going to reach for anyway.
 
-- `uv` handles package and environment plumbing
-- `vex` handles AI app workflow and policy
-- `vex-ai-runtime` handles packaged inference execution
+---
 
-## Planned Commands
+## Why vex
 
-- `vex init agent`
-- `vex init inference-api`
-- `vex dev`
-- `vex benchmark`
-- `vex eval`
-- `vex policy`
-- `vex package-model`
-- `vex deploy`
-- `vex run --sandbox`
-- `vex doctor ai`
+Python AI apps are a duct-taped stack. You install PydanticAI by hand, bolt on promptfoo, hand-roll a Dockerfile, wire up ollama somewhere, and your eval harness is three scripts glued together. `uv` already owns packaging. Nothing owns the workflow.
 
-## Current Implemented AI Commands
+`vex` is the workflow. It is explicitly **not** a new resolver, lockfile, or runtime (see [`docs/architecture.md`](docs/architecture.md#non-goals)). It composes:
 
-- `vex init agent <path>` and `vex init inference-api <path>`
-- `vex benchmark --command ... --runs ... --warmup ... --out ...`
-- `vex eval --command ... --dataset ... --out ...`
-- `vex eval --per-case --command "... {input} ..."` for dataset-driven checks
-- `vex policy list|get|set|unset`
-- `vex run --sandbox ...`
-- `vex package-model <model.onnx> [--skip-compat-check]`
-- `vex deploy docker|cloud-run|modal` (with `--apply` / `--run` on supported targets)
-- `vex deploy --profile <name>` to load defaults from `deploy.targets.toml`
-- `vex deploy check [--for all|docker|cloud-run|modal]` for deployment preflight
-- deploy profiles support inheritance (`inherit = "default"`) and env interpolation (for example `${VEX_IMAGE_REPO}`)
-- `vex schema validate-model [artifact_dir]`
+- [`uv`](https://docs.astral.sh/uv/) — envs, deps, lockfile, Python versions
+- [PydanticAI](https://ai.pydantic.dev) + [`pydantic-settings`](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) — typed agents and config
+- [`ollama`](https://ollama.com) — local-first model fallback when no API key is set
+- [`promptfoo`](https://www.promptfoo.dev) / [`deepeval`](https://www.deepeval.com) — evals you can gate CI on
+- [`vex-ai-runtime`](engine/vex-ai-runtime/) — native execution and signed model artifacts
+- Docker / Cloud Run / Modal — deploy targets that already work
 
-`vex init agent` and `vex init inference-api` now also scaffold `deploy.targets.toml` with `default` and `prod` profiles.
-
-`vex package-model` now emits a versioned manifest with compatibility fields:
-
-```json
-{
-  "schema_version": "v1",
-  "runtime": "vex-ai-runtime",
-  "engine": "onnxruntime",
-  "model_path": "models/model.onnx"
-}
-```
-
-## Repository Layout
-
-- `src/vex/`: prototype CLI
-- `tests/`: lightweight CLI tests
-- `docs/architecture.md`: integration choices and non-goals
-- `docs/roadmap.md`: command surface and phased plan
-- `engine/vex-ai-runtime/`: embedded runtime engine for native execution and secure model packaging
-- `.github/workflows/ci.yml`: CI for CLI + runtime tests
-
-## Running The Prototype
+## Install
 
 ```bash
+uv tool install vex          # recommended
+# or run straight from the repo:
 PYTHONPATH=src python3 -m vex --help
-PYTHONPATH=src python3 -m vex init agent demo-agent
-PYTHONPATH=src python3 -m vex init inference-api demo-api
-PYTHONPATH=src python3 -m vex benchmark --command "python -c 'print(1)'" --runs 3 --warmup 1
-PYTHONPATH=src python3 -m vex eval --command "python -c 'print(1)'" --dataset evals/datasets/cases.jsonl
-PYTHONPATH=src python3 -m vex policy list
-PYTHONPATH=src python3 -m vex policy set network allow --type str
-PYTHONPATH=src python3 -m vex policy get network
-PYTHONPATH=src python3 -m vex package-model path/to/model.onnx --out-dir dist/model
-PYTHONPATH=src python3 -m vex schema validate-model dist/model
-PYTHONPATH=src python3 -m vex deploy check --for all
-PYTHONPATH=src python3 -m vex deploy cloud-run --service demo-service --apply
-PYTHONPATH=src python3 -m vex deploy modal --app-name demo-app --run
-PYTHONPATH=src python3 -m vex doctor
-PYTHONPATH=src python3 -m vex doctor ai
-PYTHONPATH=src python3 -m vex run --sandbox "echo hello"
-PYTHONPATH=src python3 -m vex python list
-PYTHONPATH=src python3 -m vex test
-PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
-`vex` currently requires `uv` to be installed and available on `PATH`.
+`vex` requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
 
-You can run all monorepo tests with:
+## How it composes
+
+```
+  pyproject.toml            (single source of truth)
+        │
+        ├── [tool.vex.scripts]      dev / benchmark / eval / test / lint / format / typecheck
+        ├── [tool.vex.policy]       sandbox / network / filesystem / memory / pids
+        ├── [tool.vex.ai]           template / runtime selection
+        └── [project.optional-dependencies]   agent / api / eval extras
+        │
+  vex ──┼── uv ──────────── install, lock, sync, python versions, build, publish
+        ├── vex-ai-runtime ─ native model load, schema validation, policy enforcement
+        ├── ollama ───────── local fallback when no API key
+        ├── promptfoo ────── eval adapter (when promptfooconfig.yaml exists)
+        └── deploy ───────── docker | cloud-run | modal
+```
+
+Every verb is a thin wrapper. Escape hatches everywhere — if you want `uv run foo` directly, go do it.
+
+## What works today
+
+- `vex init agent <path>` — scaffolds a real PydanticAI agent: `agent.py` with a tool, `settings.py` with provider auto-resolution (openai / anthropic / ollama), `main.py` async entrypoint, `eval.py` with PASS/FAIL reporting, five seed eval cases, `prompts/system.md`, `.env.example`, `deploy.targets.toml` with `default` and `prod` profiles
+- `vex init inference-api <path>` — FastAPI + uvicorn + typed schemas
+- `vex benchmark --command ... --runs ... --warmup ...` — harness with warmup control and JSON output
+- `vex eval --command ...` and `vex eval --per-case --command "... {input} ..."` — dataset-driven checks
+- `vex policy list|get|set|unset` — inspect and override `[tool.vex.policy]`
+- `vex run --sandbox ...` — Docker/Podman-backed execution with `--cap-drop ALL`, `--network none`, read-only rootfs, memory + pids caps
+- `vex package-model <model.onnx>` — versioned manifest with compatibility metadata:
+  ```json
+  { "schema_version": "v1", "runtime": "vex-ai-runtime",
+    "engine": "onnxruntime", "model_path": "models/model.onnx" }
+  ```
+- `vex deploy docker|cloud-run|modal [--apply|--run]` — scaffold + execute; profile inheritance (`inherit = "default"`) and env interpolation (`${VEX_IMAGE_REPO}`)
+- `vex deploy check [--for all|docker|cloud-run|modal]` — preflight
+- `vex schema validate-model [artifact_dir]` — verify a packaged artifact
+- `vex doctor ai` — 13-check readiness report
+
+Every generic `uv` verb (`add`, `remove`, `sync`, `lock`, `build`, `publish`, `python`, `tool`, `run`, `test`, `lint`, `format`, `typecheck`) is also exposed as a thin passthrough so a vex project stays a normal Python project.
+
+## Try it
+
+```bash
+vex init agent demo
+cd demo
+uv sync --extra agent
+vex doctor ai                 # expect mostly green
+vex dev                       # talks to your configured model (or ollama fallback)
+vex eval                      # runs the seed dataset, prints PASS/FAIL
+vex deploy check --for all
+```
+
+No API key? `vex` falls back to a local [`ollama`](https://ollama.com) model — no code changes.
+
+## Repository layout
+
+- `src/vex/` — CLI and workflow control plane
+- `engine/vex-ai-runtime/` — Rust + PyO3 runtime for native execution and model artifact validation
+- `tests/` — CLI test suite
+- `docs/` — architecture, product boundary, roadmap
+- `.github/workflows/` — CI for CLI + runtime
+
+## Where this is going
+
+The roadmap ([`docs/roadmap.md`](docs/roadmap.md)) and product boundary ([`docs/product-boundary.md`](docs/product-boundary.md)) spell it out:
+
+- `vex dev` upgraded to a real dev loop: [`watchfiles`](https://watchfiles.helpmanual.io) hot reload + local ollama fallback + inline trace tail
+- `vex eval` adapters for promptfoo and deepeval, with `--json` CI output and pass-rate gates
+- `vex deploy modal|cloud-run` as full end-to-end deployments, not just scaffolding
+- `vex doctor ai` extended to verify ollama availability, model reachability, eval dataset shape, deploy profile env vars
+- More opinionated `examples/` tree with runnable agents, inference APIs, and local RAG
+
+## Design principles
+
+Lifted verbatim from [`docs/architecture.md`](docs/architecture.md):
+
+1. `pyproject.toml` is the source of truth.
+2. Default to a local `.venv` per project.
+3. Prefer delegation to mature tools over reimplementation.
+4. Keep the command surface small.
+5. Optimize for AI app developers first.
+6. Treat runtime choice, policy, and model packaging as first-class workflow concerns.
+
+## Running the test suite
 
 ```bash
 make test
 ```
 
-See `CONTRIBUTING.md` for development workflow details.
+Runs the Python CLI tests and the `vex-ai-runtime` Rust + Python tests.
 
-The current codebase is still in transition from generic workflow bootstrap toward the AI-native direction above.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full dev loop.
 
-## Repo Strategy
+---
 
-Short answer: keeping `vex` and `vex-ai-runtime` as separate packages is still useful, but a monorepo is likely better during this phase.
-
-- `vex`: workflow/control plane (init/dev/eval/policy/deploy)
-- `vex-ai-runtime`: native execution + model artifact validation
-
-Why separate packages still matter:
-
-- cleaner boundaries and dependency surfaces
-- runtime can evolve independently
-- easier to consume runtime without the full CLI stack
-
-Why a monorepo is likely better right now:
-
-- faster coordinated changes across CLI + runtime schema
-- easier refactors during heavy iteration
-- less cross-repo sync overhead
-
-The current implementation supports both styles by resolving `vex-ai-runtime` from common locations, and it also supports an explicit override via `VEX_AI_RUNTIME_PATH`.
-
-Current local layout in this workspace:
-
-- `vex/` (main CLI/workflow repo)
-- `vex/engine/vex-ai-runtime/` (embedded runtime engine)
+vex is early. Expect sharp edges, missing polish, and a few commands that still read as bootstrap plumbing. The direction is firm: make the AI app path obvious, one composed workflow at a time.
