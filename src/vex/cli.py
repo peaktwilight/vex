@@ -391,7 +391,7 @@ def doctor_checks(root: Path, scope: str | None = None) -> tuple[int, list[str]]
         lines.append("WARN no [tool.vex.scripts] aliases configured")
 
     if scope == "ai":
-        for script_name in ("dev", "benchmark"):
+        for script_name in ("dev", "benchmark", "eval"):
             if script_name in scripts:
                 lines.append(f"OK  found AI workflow script '{script_name}'")
             else:
@@ -404,6 +404,36 @@ def doctor_checks(root: Path, scope: str | None = None) -> tuple[int, list[str]]
         else:
             issues += 1
             lines.append("WARN missing [tool.vex.policy] configuration")
+
+        deploy_targets_path = root / "deploy.targets.toml"
+        deploy_config = load_deploy_targets(root)
+        profiles = deploy_config.get("profiles", {}) if isinstance(deploy_config, dict) else {}
+        if deploy_targets_path.exists() and isinstance(profiles, dict) and "default" in profiles:
+            lines.append("OK  found deploy.targets.toml with default profile")
+        else:
+            issues += 1
+            lines.append("WARN missing deploy.targets.toml default profile")
+
+        runtime_root = resolve_runtime_root(root)
+        if runtime_root is not None:
+            lines.append(f"OK  runtime path resolved to {runtime_root}")
+            schema_path = runtime_root / "schemas" / "vex-model-schema.json"
+            if schema_path.exists():
+                lines.append("OK  found shared model schema in runtime")
+            else:
+                issues += 1
+                lines.append("WARN runtime schema file missing")
+        else:
+            issues += 1
+            lines.append("WARN runtime path not resolved (set VEX_AI_RUNTIME_PATH if needed)")
+
+        if bool(policy.get("sandbox", True)):
+            backend = sandbox_backend(policy)
+            if backend == "none":
+                issues += 1
+                lines.append("WARN no sandbox backend detected (install docker or podman)")
+            else:
+                lines.append(f"OK  sandbox backend detected: {backend}")
 
         drift = schema_drift_warning(root)
         if drift:

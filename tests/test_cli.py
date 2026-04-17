@@ -300,7 +300,56 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("WARN missing AI workflow script 'dev'", output)
+        self.assertIn("WARN missing AI workflow script 'eval'", output)
         self.assertIn("WARN missing [tool.vex.policy] configuration", output)
+
+    @patch("vex.cli.sandbox_backend", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_reports_healthy_setup(self, _uv_bin: object, _sandbox_backend: object) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime_root = root / "engine" / "vex-ai-runtime"
+            (runtime_root / "schemas").mkdir(parents=True)
+            (runtime_root / "schemas" / "vex-model-schema.json").write_text(
+                '{"schema":"vex-model/v1","schema_version":"v1","runtime":"vex-ai-runtime","engine":"onnxruntime"}\n',
+                encoding="utf-8",
+            )
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.env]\npath = \".venv\"\n\n"
+                "[tool.vex.scripts]\n"
+                'dev = "python -m demo.main"\n'
+                'benchmark = "python -m demo.benchmark"\n'
+                'eval = "python evals/run_eval.py --input {input}"\n'
+                'test = "pytest"\n\n'
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n',
+                encoding="utf-8",
+            )
+            (root / "deploy.targets.toml").write_text(
+                "[profiles.default]\n"
+                'image = "ghcr.io/example/demo"\n',
+                encoding="utf-8",
+            )
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            (root / ".venv").mkdir()
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        self.assertIn("OK  found AI workflow script 'dev'", output)
+        self.assertIn("OK  found AI workflow script 'benchmark'", output)
+        self.assertIn("OK  found AI workflow script 'eval'", output)
+        self.assertIn("OK  found deploy.targets.toml with default profile", output)
+        self.assertIn("OK  runtime path resolved to", output)
+        self.assertIn("OK  found shared model schema in runtime", output)
+        self.assertIn("OK  sandbox backend detected: docker", output)
 
     def test_policy_prints_config(self) -> None:
         original_cwd = os.getcwd()
