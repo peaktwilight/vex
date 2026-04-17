@@ -334,9 +334,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("WARN missing AI workflow script 'eval'", output)
         self.assertIn("WARN missing [tool.vex.policy] configuration", output)
 
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-testkey"}, clear=False)
+    @patch("vex.cli.sandbox_image_cached", return_value=True)
     @patch("vex.cli.sandbox_backend", return_value="docker")
     @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
-    def test_doctor_ai_reports_healthy_setup(self, _uv_bin: object, _sandbox_backend: object) -> None:
+    def test_doctor_ai_reports_healthy_setup(
+        self, _uv_bin: object, _sandbox_backend: object, _image_cached: object
+    ) -> None:
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -381,6 +385,95 @@ class CliTests(unittest.TestCase):
         self.assertIn("OK  runtime path resolved to", output)
         self.assertIn("OK  found shared model schema in runtime", output)
         self.assertIn("OK  sandbox backend detected: docker", output)
+        self.assertIn("OK  sandbox image cached locally", output)
+        self.assertIn("OK  hosted provider credential detected: openai (OPENAI_API_KEY)", output)
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_warns_when_no_provider_and_no_ollama(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn(
+            "WARN no hosted provider keys set and 'ollama' not on PATH",
+            output,
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.shutil.which", return_value=None)
+    @patch("vex.cli.sandbox_image_cached", return_value=None)
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_validates_eval_dataset_and_deploy_env(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+        _which: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            datasets_dir = root / "evals" / "datasets"
+            datasets_dir.mkdir(parents=True)
+            (datasets_dir / "good.jsonl").write_text(
+                '{"input": "a"}\n{"input": "b"}\n',
+                encoding="utf-8",
+            )
+            (datasets_dir / "broken.jsonl").write_text(
+                '{"input": "ok"}\n{not json\n{"no_input": true}\n',
+                encoding="utf-8",
+            )
+            (root / "deploy.targets.toml").write_text(
+                "[profiles.default]\n"
+                'image = "${VEX_IMAGE_REPO}/demo"\n'
+                'region = "${VEX_DEPLOY_REGION}"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("OK  eval dataset evals/datasets/good.jsonl: 2 cases valid", output)
+        self.assertIn("WARN evals/datasets/broken.jsonl", output)
+        self.assertIn("invalid JSON", output)
+        self.assertIn(
+            "WARN deploy.targets.toml references unbound env vars: "
+            "VEX_DEPLOY_REGION, VEX_IMAGE_REPO",
+            output,
+        )
 
     def test_policy_prints_config(self) -> None:
         original_cwd = os.getcwd()
