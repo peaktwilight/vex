@@ -398,6 +398,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertIn('template = "agent"', pyproject_text)
+        self.assertIn("package-mode = true", pyproject_text)
         self.assertIn('dev = "python -m support_agent.main"', pyproject_text)
         self.assertIn('benchmark = "python -m support_agent.benchmark"', pyproject_text)
         self.assertIn('eval = "python evals/run_eval.py --input {input}"', pyproject_text)
@@ -443,6 +444,23 @@ class CliTests(unittest.TestCase):
         for line in case_lines:
             parsed = _json.loads(line)
             self.assertIn("input", parsed)
+
+    def test_init_agent_produces_portable_python_floor(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(["init", "agent", "portable-agent"])
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "portable-agent"
+            pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+            python_version = (root / ".python-version").read_text(encoding="utf-8").strip()
+
+        self.assertEqual(code, 0)
+        self.assertIn('requires-python = ">=3.11"', pyproject)
+        self.assertEqual(python_version, "3.12")
 
     def test_init_inference_api_creates_template_files(self) -> None:
         original_cwd = os.getcwd()
