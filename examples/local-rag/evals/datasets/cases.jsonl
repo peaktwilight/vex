@@ -1,0 +1,6 @@
+{"input": "What does vex boundary say about what vex owns?", "expect_doc": "boundary.md"}
+{"input": "Which engine does the runtime default to for onnxruntime artifacts?", "expect_doc": "runtime.md"}
+{"input": "List the vex architecture principles about source of truth", "expect_doc": "architecture.md"}
+{"input": "What is on the roadmap for watchfiles hot reload?", "expect_doc": "roadmap.md"}
+{"input": "What does vex init commands scaffold?", "expect_doc": "commands.md"}
+{"input": "What does package-model write to the manifest artifact?", "expect_doc": "runtime.md"}

@@ -1,0 +1,13 @@
+[profiles.default]
+image = "ghcr.io/example/inference-api"
+tag = "latest"
+service = "inference-api"
+region = "us-central1"
+app_name = "inference-api"
+push = false
+
+[profiles.prod]
+inherit = "default"
+tag = "prod"
+image = "${VEX_IMAGE_REPO:-ghcr.io/example/inference-api}"
+push = true

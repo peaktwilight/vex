@@ -1,0 +1,6 @@
+{"input": "great product", "expect_label": "positive"}
+{"input": "love it", "expect_label": "positive"}
+{"input": "it is okay", "expect_label": "neutral"}
+{"input": "as expected", "expect_label": "neutral"}
+{"input": "awful experience", "expect_label": "negative"}
+{"input": "do not buy", "expect_label": "negative"}
