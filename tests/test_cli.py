@@ -719,6 +719,42 @@ class CliTests(unittest.TestCase):
         self.assertIn("Wrote Cloud Run scaffold", output)
         self.assertIn("name: demo-svc", content)
 
+    @patch("vex.cli.detect_gcloud_project", return_value="demo-project")
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    @patch("vex.cli.shutil.which")
+    def test_deploy_check_reports_ready_state(
+        self,
+        which_mock: object,
+        _uv_bin: object,
+        _docker: object,
+        _project: object,
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/bin/tool" if name in {"gcloud", "modal"} else None
+        code, output = self.run_cli(["deploy", "check"])
+        self.assertEqual(code, 0)
+        self.assertIn("OK  uv available", output)
+        self.assertIn("OK  docker-compatible CLI found: docker", output)
+        self.assertIn("OK  gcloud CLI found", output)
+        self.assertIn("OK  modal CLI found", output)
+
+    @patch("vex.cli.detect_gcloud_project", return_value=None)
+    @patch("vex.cli.docker_like_bin", return_value=None)
+    @patch("vex.cli.uv_bin", return_value=None)
+    @patch("vex.cli.shutil.which", return_value=None)
+    def test_deploy_check_reports_missing_tools(
+        self,
+        _which: object,
+        _uv_bin: object,
+        _docker: object,
+        _project: object,
+    ) -> None:
+        code, output = self.run_cli(["deploy", "check"])
+        self.assertEqual(code, 1)
+        self.assertIn("WARN uv not found", output)
+        self.assertIn("WARN docker/podman not found", output)
+        self.assertIn("WARN gcloud CLI not found", output)
+
     @patch("vex.cli.run_command", return_value=0)
     @patch("vex.cli.shutil.which", return_value="/usr/bin/gcloud")
     def test_deploy_cloud_run_apply_invokes_gcloud(self, _which: object, run_command: object) -> None:

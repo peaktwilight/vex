@@ -95,6 +95,7 @@ Under the hood:
 - `vex package-model <model.onnx> [--skip-compat-check]`
 - `vex deploy docker|cloud-run|modal` (with `--apply` / `--run` on supported targets)
 - `vex deploy --profile <name>` to load defaults from `deploy.targets.toml`
+- `vex deploy check [--for all|docker|cloud-run|modal]` for deployment preflight
 - deploy profiles support inheritance (`inherit = "default"`) and env interpolation (for example `${VEX_IMAGE_REPO}`)
 - `vex schema validate-model [artifact_dir]`
 
@@ -133,6 +134,7 @@ PYTHONPATH=src python3 -m vex policy set network allow --type str
 PYTHONPATH=src python3 -m vex policy get network
 PYTHONPATH=src python3 -m vex package-model path/to/model.onnx --out-dir dist/model
 PYTHONPATH=src python3 -m vex schema validate-model dist/model
+PYTHONPATH=src python3 -m vex deploy check --for all
 PYTHONPATH=src python3 -m vex deploy cloud-run --service demo-service --apply
 PYTHONPATH=src python3 -m vex deploy modal --app-name demo-app --run
 PYTHONPATH=src python3 -m vex doctor
