@@ -1,0 +1,13 @@
+[profiles.default]
+image = "ghcr.io/example/support-bot"
+tag = "latest"
+service = "support-bot-agent"
+region = "us-central1"
+app_name = "support-bot-agent"
+push = false
+
+[profiles.prod]
+inherit = "default"
+tag = "prod"
+image = "${VEX_IMAGE_REPO:-ghcr.io/example/support-bot}"
+push = true

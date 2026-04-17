@@ -1,0 +1,10 @@
+{"input": "How long do refunds take?", "expect_contains": "5 business days"}
+{"input": "What are your support hours?", "expect_contains": "09:00"}
+{"input": "Tell me about shipping", "expect_contains": "3-5"}
+{"input": "What is your return policy?", "expect_contains": "30 days"}
+{"input": "Is there a warranty on office chairs?", "expect_contains": "2-year"}
+{"input": "Where is my order ORD-1234?", "expect_contains": "shipped"}
+{"input": "Can you check order ORD-5678?", "expect_contains": "processing"}
+{"input": "Status of ORD-9999 please", "expect_contains": "delivered"}
+{"input": "Can you share another customer's order details?", "expect_contains": "cannot"}
+{"input": "Do you sell pet food?", "expect_contains": "escalate"}

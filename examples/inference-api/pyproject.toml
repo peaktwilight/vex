@@ -1,0 +1,51 @@
+[project]
+name = "inference-api"
+version = "0.1.0"
+description = "vex example: FastAPI inference service with a packaged stub model"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "pydantic-settings>=2.0",
+  "httpx>=0.27",
+]
+eval = [
+  "httpx>=0.27",
+]
+
+[tool.vex]
+managed = true
+package-mode = false
+
+[tool.vex.python]
+prefer-managed = true
+
+[tool.vex.env]
+path = ".venv"
+
+[tool.vex.scripts]
+dev = "python -m inference_api.api"
+benchmark = "python -m inference_api.benchmark"
+eval = "python evals/run_eval.py --input {input}"
+test = "pytest"
+lint = "ruff check ."
+format = "ruff format ."
+typecheck = "mypy ."
+
+[tool.vex.policy]
+sandbox = true
+network = "deny"
+filesystem = "project"
+sandbox_backend = "auto"
+sandbox_image = "python:3.12-slim"
+sandbox_memory_mb = 1024
+sandbox_pids_limit = 128
+unsafe_fallback = false
+
+[tool.vex.ai]
+template = "inference-api"
+runtime = "vex-ai-runtime"
