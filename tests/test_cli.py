@@ -24,6 +24,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("AI-native workflow tool for Python apps.", output)
 
+    @patch.dict(os.environ, {}, clear=True)
     @patch("vex.cli.uv_bin", return_value="uv")
     @patch("vex.cli.run_command", return_value=0)
     def test_dev_command_uses_script_alias(self, run_command: object, _uv_bin: object) -> None:
@@ -37,7 +38,7 @@ class CliTests(unittest.TestCase):
             )
             os.chdir(temp_dir)
             try:
-                code, _output = self.run_cli(["dev", "--bind", "127.0.0.1"])
+                code, _output = self.run_cli(["dev", "--no-reload", "--bind", "127.0.0.1"])
             finally:
                 os.chdir(original_cwd)
 
@@ -46,6 +47,204 @@ class CliTests(unittest.TestCase):
             ["uv", "run", "sh", "-c", "python -m http.server --bind 127.0.0.1"],
             cwd=None,
         )
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True)
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_dev_banner_prints_openai_when_openai_key_set(
+        self, _run_command: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.scripts]\n"
+                'dev = "python -m http.server"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["dev", "--no-reload"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("provider=openai", output)
+        self.assertNotIn("provider=ollama", output)
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_dev_banner_prints_ollama_when_ollama_on_path(
+        self, _run_command: object, _uv_bin: object, which: object
+    ) -> None:
+        which.return_value = "/usr/local/bin/ollama"
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.scripts]\n"
+                'dev = "python -m http.server"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["dev", "--no-reload"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("provider=ollama", output)
+        self.assertNotIn("ollama not on PATH", output)
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_dev_banner_prints_install_pointer_when_no_keys_and_no_ollama(
+        self, _run_command: object, _uv_bin: object, which: object
+    ) -> None:
+        which.return_value = None
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.scripts]\n"
+                'dev = "python -m http.server"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["dev", "--no-reload"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("provider=ollama", output)
+        self.assertIn("ollama not on PATH", output)
+        self.assertIn("https://ollama.com", output)
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_dev_flags_are_not_leaked_into_script_args(
+        self, run_command: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.scripts]\n"
+                'dev = "python -m http.server"\n',
+                encoding="utf-8",
+            )
+            (Path(temp_dir) / "extra").mkdir()
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["dev", "--no-reload", "--watch", "extra", "--bind", "127.0.0.1"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        run_command.assert_called_once_with(
+            ["uv", "run", "sh", "-c", "python -m http.server --bind 127.0.0.1"],
+            cwd=None,
+        )
+
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=True)
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_dev_no_provider_check_suppresses_banner(
+        self, _run_command: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.scripts]\n"
+                'dev = "python -m http.server"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["dev", "--no-provider-check", "--no-reload"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertNotIn("[vex dev] provider=", output)
+
+    def test_resolve_dev_watch_paths_includes_flag_paths(self) -> None:
+        from vex.cli import resolve_dev_watch_paths
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "src").mkdir()
+            (root / "extra").mkdir()
+            paths = resolve_dev_watch_paths(["extra"], root)
+
+        resolved = [p.name for p in paths]
+        self.assertIn("src", resolved)
+        self.assertIn("extra", resolved)
+
+    def test_resolve_dev_watch_paths_reads_pyproject_dev_watch(self) -> None:
+        from vex.cli import resolve_dev_watch_paths
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "src").mkdir()
+            (root / "prompts").mkdir()
+            (root / "pyproject.toml").write_text(
+                "[tool.vex.dev]\nwatch = [\"prompts\"]\n",
+                encoding="utf-8",
+            )
+            paths = resolve_dev_watch_paths([], root)
+
+        resolved = [p.name for p in paths]
+        self.assertIn("src", resolved)
+        self.assertIn("prompts", resolved)
+
+    def test_resolve_dev_watch_paths_skips_missing_paths(self) -> None:
+        from vex.cli import resolve_dev_watch_paths
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = resolve_dev_watch_paths(["does-not-exist"], root)
+
+        self.assertEqual(paths, [])
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_uv", return_value=0)
+    def test_dev_falls_back_to_no_reload_when_watchfiles_missing(
+        self, run_uv: object, _uv_bin: object
+    ) -> None:
+        from vex.cli import run_dev_with_reload
+
+        uv_args = ["run", "sh", "-c", "python -m http.server"]
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir, contextlib.redirect_stdout(buffer):
+            code = run_dev_with_reload(uv_args, [Path(temp_dir)], watchfiles_module=None)
+
+        self.assertEqual(code, 0)
+        run_uv.assert_called_once_with(uv_args)
+        self.assertIn("watchfiles", buffer.getvalue())
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_resolve_dev_provider_prefers_openai_then_anthropic_then_ollama(self) -> None:
+        from vex.cli import resolve_dev_provider
+
+        self.assertEqual(resolve_dev_provider({"OPENAI_API_KEY": "sk-x"}), "openai")
+        self.assertEqual(
+            resolve_dev_provider({"ANTHROPIC_API_KEY": "sk-ant-x"}),
+            "anthropic",
+        )
+        self.assertEqual(
+            resolve_dev_provider(
+                {"OPENAI_API_KEY": "sk-x", "ANTHROPIC_API_KEY": "sk-ant-x"}
+            ),
+            "openai",
+        )
+        self.assertEqual(resolve_dev_provider({}), "ollama")
 
     @patch("vex.cli.uv_bin", return_value="uv")
     @patch("vex.cli.run_command", return_value=0)

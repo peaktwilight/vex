@@ -1702,6 +1702,14 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.set_defaults(handler=handle_init)
 
     dev_parser = subparsers.add_parser("dev", help=COMMAND_HELP["dev"])
+    dev_parser.add_argument("--no-reload", dest="no_reload", action="store_true")
+    dev_parser.add_argument("--watch", dest="watch", action="append", default=[])
+    dev_parser.add_argument(
+        "--provider-check",
+        dest="provider_check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     dev_parser.add_argument("args", nargs=argparse.REMAINDER)
     dev_parser.set_defaults(handler=handle_dev)
 
@@ -1896,12 +1904,183 @@ def handle_init(args: argparse.Namespace) -> int:
     return code
 
 
+_DEV_PROVIDER_ENV_KEYS: tuple[tuple[str, str], ...] = (
+    ("OPENAI_API_KEY", "openai"),
+    ("ANTHROPIC_API_KEY", "anthropic"),
+)
+
+
+def resolve_dev_provider(env: dict[str, str] | None = None) -> str:
+    """Mirror the scaffolded settings.py provider resolution.
+
+    OPENAI_API_KEY -> openai, ANTHROPIC_API_KEY -> anthropic, else ollama.
+    """
+    source = os.environ if env is None else env
+    for key, name in _DEV_PROVIDER_ENV_KEYS:
+        if source.get(key):
+            return name
+    return "ollama"
+
+
+def dev_provider_banner_lines(
+    env: dict[str, str] | None = None,
+    which: object = None,
+) -> list[str]:
+    """Build the one-or-two-line provider banner emitted at `vex dev` start."""
+    provider = resolve_dev_provider(env)
+    lines = [f"[vex dev] provider={provider}"]
+    if provider == "ollama":
+        which_fn = which if which is not None else shutil.which
+        if which_fn("ollama") is None:
+            lines.append(
+                "[vex dev] ollama not on PATH — install from https://ollama.com "
+                "or set OPENAI_API_KEY / ANTHROPIC_API_KEY"
+            )
+    return lines
+
+
+def load_vex_dev_watch_paths(root: Path) -> list[str]:
+    """Read `[tool.vex.dev].watch` from pyproject.toml if present.
+
+    Accepts a list of strings. Anything else is ignored.
+    """
+    data = load_pyproject(root)
+    dev = data.get("tool", {}).get("vex", {}).get("dev", {})
+    if not isinstance(dev, dict):
+        return []
+    watch = dev.get("watch")
+    if not isinstance(watch, list):
+        return []
+    return [str(item) for item in watch if isinstance(item, (str, os.PathLike))]
+
+
+def resolve_dev_watch_paths(
+    extra_paths: Sequence[str],
+    root: Path,
+) -> list[Path]:
+    """Resolve watch paths for `vex dev --reload`.
+
+    Order: `src/` (if it exists), pyproject `[tool.vex.dev].watch`, `--watch` flags.
+    Non-existent paths are skipped. Duplicates removed, preserving first occurrence.
+    """
+    candidates: list[str] = []
+    src_dir = root / "src"
+    if src_dir.is_dir():
+        candidates.append(str(src_dir))
+    candidates.extend(load_vex_dev_watch_paths(root))
+    candidates.extend(extra_paths)
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for raw in candidates:
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = (root / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        if not candidate.exists():
+            continue
+        seen.add(candidate)
+        resolved.append(candidate)
+    return resolved
+
+
+def _try_import_watchfiles() -> Any:
+    try:
+        import watchfiles  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    return watchfiles
+
+
+def run_dev_with_reload(
+    uv_args: list[str],
+    watch_paths: Sequence[Path],
+    watchfiles_module: Any = None,
+) -> int:
+    """Start the dev command and restart it whenever a watched path changes.
+
+    Graceful shutdown: SIGTERM, wait up to 3s, then SIGKILL.
+    """
+    if watchfiles_module is None:
+        watchfiles_module = _try_import_watchfiles()
+    if watchfiles_module is None:
+        print(
+            "[vex dev] 'watchfiles' is not installed — running without reload "
+            "(install with: uv add watchfiles)"
+        )
+        return run_uv(uv_args)
+
+    uv = uv_bin()
+    if uv is None:
+        print("vex requires 'uv' on PATH", file=sys.stderr)
+        return 127
+
+    if not watch_paths:
+        print("[vex dev] no watch paths found — running without reload")
+        return run_uv(uv_args)
+
+    argv = [uv, *uv_args]
+    str_paths = [str(p) for p in watch_paths]
+    print(f"[vex dev] watching {len(str_paths)} path(s) for changes")
+
+    def _spawn() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(argv)
+
+    def _shutdown(proc: subprocess.Popen[bytes]) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    proc = _spawn()
+    try:
+        for _changes in watchfiles_module.watch(*str_paths):
+            print("[vex dev] change detected — restarting")
+            _shutdown(proc)
+            proc = _spawn()
+    except KeyboardInterrupt:
+        _shutdown(proc)
+        return 130
+    finally:
+        _shutdown(proc)
+
+    return proc.returncode if proc.returncode is not None else 0
+
+
 def handle_dev(args: argparse.Namespace) -> int:
-    uv_args = resolve_required_script_args("dev", args.args, project_root())
+    root = project_root()
+    provider_check = getattr(args, "provider_check", True)
+    if provider_check:
+        for line in dev_provider_banner_lines():
+            print(line)
+
+    uv_args = resolve_required_script_args("dev", args.args, root)
     if uv_args is None:
         print("vex dev requires [tool.vex.scripts].dev in pyproject.toml")
         return 2
-    return run_uv(uv_args)
+
+    if getattr(args, "no_reload", False):
+        return run_uv(uv_args)
+
+    extra_watch = list(getattr(args, "watch", []) or [])
+    watch_paths = resolve_dev_watch_paths(extra_watch, root)
+    return run_dev_with_reload(uv_args, watch_paths)
 
 
 def handle_benchmark(args: argparse.Namespace) -> int:
@@ -2195,6 +2374,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             index = 1
             while index < len(raw_argv) and raw_argv[index] in {"--sandbox"}:
                 index += 1
+            args.args = raw_argv[index:]
+        elif getattr(args, "command", None) == "dev":
+            index = 1
+            dev_flag_values = {"--watch"}
+            dev_flag_switches = {
+                "--no-reload",
+                "--provider-check",
+                "--no-provider-check",
+            }
+            while index < len(raw_argv):
+                token = raw_argv[index]
+                if token in dev_flag_switches:
+                    index += 1
+                    continue
+                if token in dev_flag_values:
+                    index += 2
+                    continue
+                if token.startswith("--watch="):
+                    index += 1
+                    continue
+                break
             args.args = raw_argv[index:]
         else:
             args.args = raw_argv[1:]
