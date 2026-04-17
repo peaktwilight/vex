@@ -61,6 +61,7 @@ Every verb is a thin wrapper. Escape hatches everywhere — if you want `uv run 
 - `vex init inference-api <path>` — FastAPI + uvicorn + typed schemas
 - `vex benchmark --command ... --runs ... --warmup ...` — harness with warmup control and JSON output
 - `vex eval --command ...` and `vex eval --per-case --command "... {input} ..."` — dataset-driven checks
+- `vex eval` auto-delegates to [`promptfoo`](https://www.promptfoo.dev) via `uvx` when `promptfooconfig.yaml` is present. Use `--no-promptfoo` to force the built-in harness, `--json` for machine-readable output, and `--min-pass-rate 0.9` to gate CI on a fraction of passing cases. Override defaults in `[tool.vex.eval]` (`adapter = "auto"|"promptfoo"|"harness"`, `min_pass_rate = 0.9`).
 - `vex policy list|get|set|unset` — inspect and override `[tool.vex.policy]`
 - `vex run --sandbox ...` — Docker/Podman-backed execution with `--cap-drop ALL`, `--network none`, read-only rootfs, memory + pids caps
 - `vex package-model <model.onnx>` — versioned manifest with compatibility metadata:

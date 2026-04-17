@@ -787,6 +787,307 @@ class CliTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["exact_ok"], True)
         self.assertEqual(report["results"][1]["json_path_ok"], True)
 
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_detects_promptfoo_config(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            output_path = Path(argv[argv.index("--output") + 1])
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "results": {
+                            "results": [
+                                {
+                                    "success": True,
+                                    "prompt": {"raw": "hello"},
+                                    "response": {"output": "hi"},
+                                    "provider": {"id": "openai:gpt-4o-mini"},
+                                    "latencyMs": 123,
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "promptfooconfig.yaml").write_text("providers: []\n", encoding="utf-8")
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    ["eval", "--out", "artifacts/evals/promptfoo.json"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "promptfoo.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("adapter=promptfoo", output)
+        self.assertEqual(report["adapter"], "promptfoo")
+        self.assertEqual(subprocess_run.call_count, 1)
+        invoked_argv = subprocess_run.call_args.args[0]
+        self.assertEqual(invoked_argv[:4], ["/usr/local/bin/uvx", "promptfoo", "eval", "-c"])
+        self.assertIn("--output", invoked_argv)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture", return_value=(0, "out", ""))
+    def test_eval_no_promptfoo_flag_uses_harness(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "promptfooconfig.yaml").write_text("providers: []\n", encoding="utf-8")
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a"}\n', encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--no-promptfoo",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--out",
+                        "artifacts/evals/forced.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "forced.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("mode=per-case", output)
+        self.assertEqual(report["adapter"], "harness")
+        self.assertEqual(report["mode"], "per-case")
+        run_capture.assert_called_once()
+
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_normalizes_promptfoo_results(
+        self, subprocess_run: object, which_mock: object
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        fake_payload = {
+            "results": {
+                "results": [
+                    {
+                        "success": True,
+                        "prompt": {"raw": "case-1"},
+                        "response": {"output": "ok"},
+                        "provider": "openai:gpt-4o-mini",
+                        "latencyMs": 42,
+                    },
+                    {
+                        "success": False,
+                        "prompt": {"raw": "case-2"},
+                        "response": {"output": "bad"},
+                        "provider": {"id": "openai:gpt-4o-mini"},
+                    },
+                    {
+                        "success": True,
+                        "vars": {"topic": "cats"},
+                        "output": "meow",
+                    },
+                ]
+            }
+        }
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            output_path = Path(argv[argv.index("--output") + 1])
+            output_path.write_text(json.dumps(fake_payload), encoding="utf-8")
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "promptfooconfig.yaml").write_text("providers: []\n", encoding="utf-8")
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["eval", "--out", "artifacts/evals/norm.json"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "norm.json").read_text(encoding="utf-8")
+            )
+
+        # 2/3 passed => overall harness would still flag failure (exit 1).
+        self.assertEqual(code, 1)
+        self.assertEqual(report["schema"], "vex-eval/v1")
+        self.assertEqual(report["adapter"], "promptfoo")
+        self.assertEqual(report["passed"], 2)
+        self.assertEqual(report["failed"], 1)
+        self.assertAlmostEqual(report["pass_rate"], 66.67, places=2)
+        self.assertEqual(len(report["results"]), 3)
+        self.assertEqual(report["results"][0]["input"], "case-1")
+        self.assertEqual(report["results"][0]["output"], "ok")
+        self.assertEqual(report["results"][0]["provider"], "openai:gpt-4o-mini")
+        self.assertEqual(report["results"][0]["latency_ms"], 42.0)
+        self.assertEqual(report["results"][0]["passed"], True)
+        self.assertEqual(report["results"][1]["passed"], False)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture")
+    def test_eval_min_pass_rate_gates(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        run_capture.side_effect = [
+            (0, "hit", ""),
+            (1, "miss", ""),
+            (1, "miss", ""),
+        ]
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a","expect_contains":"hit"}\n'
+                '{"input":"b","expect_contains":"hit"}\n'
+                '{"input":"c","expect_contains":"hit"}\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--min-pass-rate",
+                        "0.5",
+                        "--out",
+                        "artifacts/evals/gate.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "gate.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(report["passed"], 1)
+        self.assertEqual(report["failed"], 2)
+        self.assertIn("below --min-pass-rate", output)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture")
+    def test_eval_min_pass_rate_passes_when_above_threshold(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        run_capture.side_effect = [
+            (0, "hit", ""),
+            (0, "hit", ""),
+            (1, "miss", ""),
+        ]
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a","expect_contains":"hit"}\n'
+                '{"input":"b","expect_contains":"hit"}\n'
+                '{"input":"c","expect_contains":"hit"}\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--min-pass-rate",
+                        "0.5",
+                        "--out",
+                        "artifacts/evals/gate-pass.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        # 2/3 = 66% which is above the 50% gate, but one case hard-failed
+        # so the raw harness still exits 1. The gate itself does not fire.
+        self.assertEqual(code, 1)
+        self.assertNotIn("below --min-pass-rate", output)
+
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command_capture", return_value=(0, "hit", ""))
+    def test_eval_json_flag_prints_report_to_stdout(
+        self, run_capture: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a","expect_contains":"hit"}\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--per-case",
+                        "--command",
+                        "echo {input}",
+                        "--json",
+                        "--out",
+                        "artifacts/evals/json.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        # Must be a single JSON document — parseable without tweaks.
+        payload = json.loads(output.strip())
+        self.assertEqual(payload["schema"], "vex-eval/v1")
+        self.assertEqual(payload["adapter"], "harness")
+        self.assertEqual(payload["mode"], "per-case")
+        self.assertEqual(payload["passed"], 1)
+        # Human-friendly summary suppressed when --json is set.
+        self.assertNotIn("Eval report written", output)
+
     @patch("vex.cli.docker_like_bin", return_value="docker")
     @patch("vex.cli.run_command", return_value=0)
     def test_deploy_docker_builds_image(self, run_command: object, _docker: object) -> None:

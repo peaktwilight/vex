@@ -10,6 +10,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -249,6 +250,22 @@ def load_vex_scripts(root: Path) -> dict[str, str]:
     if not isinstance(scripts, dict):
         return {}
     return {str(key): str(value) for key, value in scripts.items()}
+
+
+def load_vex_eval_config(root: Path) -> dict[str, Any]:
+    data = load_pyproject(root)
+    config = data.get("tool", {}).get("vex", {}).get("eval", {})
+    if not isinstance(config, dict):
+        return {}
+    return {str(key): value for key, value in config.items()}
+
+
+def detect_promptfoo_config(root: Path) -> Path | None:
+    for candidate in ("promptfooconfig.yaml", "promptfooconfig.yml"):
+        path = root / candidate
+        if path.exists() and path.is_file():
+            return path
+    return None
 
 
 def load_vex_policy(root: Path) -> dict[str, object]:
@@ -1333,7 +1350,259 @@ def run_benchmark_harness(root: Path, command: str, runs: int, warmup: int, out_
     return 0 if all(code == 0 for code in exit_codes) else 1
 
 
-def run_eval_harness(root: Path, command: str, dataset_path: Path, out_path: Path) -> int:
+def _emit_eval_report(report: dict[str, Any], out_path: Path, emit_json: bool) -> None:
+    """Write report to file and either print JSON or a human summary."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if emit_json:
+        print(json.dumps(report))
+
+
+def _apply_min_pass_rate(report: dict[str, Any], threshold: float | None, exit_code: int) -> int:
+    """Return updated exit code after applying the min pass-rate gate.
+
+    Threshold is a fraction 0.0-1.0; compared against ``pass_rate`` stored as a
+    percent (0-100) inside the report, consistent with the existing per-case
+    schema.
+    """
+    if threshold is None:
+        return exit_code
+    pass_rate_percent = report.get("pass_rate", 0.0)
+    if not isinstance(pass_rate_percent, (int, float)):
+        pass_rate_percent = 0.0
+    target_percent = threshold * 100
+    if pass_rate_percent < target_percent:
+        print(
+            f"FAIL pass_rate={pass_rate_percent}% below --min-pass-rate "
+            f"{target_percent}% gate"
+        )
+        return 1 if exit_code == 0 else exit_code
+    return exit_code
+
+
+def _promptfoo_binary() -> tuple[list[str], str] | None:
+    """Resolve a command list capable of invoking promptfoo.
+
+    Prefers ``uvx`` (already required as part of the ``uv`` toolchain) and
+    falls back to a system ``promptfoo`` on PATH.
+    """
+    uvx = shutil.which("uvx")
+    if uvx:
+        return [uvx, "promptfoo"], "uvx"
+    promptfoo = shutil.which("promptfoo")
+    if promptfoo:
+        return [promptfoo], "promptfoo"
+    return None
+
+
+def normalize_promptfoo_report(
+    raw: dict[str, Any],
+    *,
+    command: str | None,
+    dataset_path: Path,
+    config_path: Path,
+) -> dict[str, Any]:
+    """Map a promptfoo JSON output to the vex-eval/v1 schema.
+
+    promptfoo's schema varies across versions; we look at ``results`` and
+    ``results.results`` (v0.x nests results under a top-level key) and fall
+    back to sensible defaults when keys are missing.
+    """
+    payload: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    nested = payload.get("results")
+    if isinstance(nested, dict):
+        payload = nested
+
+    raw_cases: Any = payload.get("results")
+    if not isinstance(raw_cases, list):
+        raw_cases = []
+
+    normalized_cases: list[dict[str, Any]] = []
+    passed = 0
+    for index, case in enumerate(raw_cases, start=1):
+        if not isinstance(case, dict):
+            continue
+        success = bool(case.get("success", case.get("pass", False)))
+        if success:
+            passed += 1
+
+        prompt = case.get("prompt") or {}
+        if isinstance(prompt, dict):
+            input_text = str(prompt.get("raw") or prompt.get("display") or "")
+        else:
+            input_text = str(prompt or "")
+        vars_value = case.get("vars")
+        if not input_text and isinstance(vars_value, dict):
+            input_text = json.dumps(vars_value, sort_keys=True)
+
+        response = case.get("response") or {}
+        output_text = ""
+        if isinstance(response, dict):
+            output_text = str(response.get("output", ""))
+        if not output_text and "output" in case:
+            output_text = str(case.get("output", ""))
+
+        provider: Any = case.get("provider")
+        if isinstance(provider, dict):
+            provider_id = str(provider.get("id") or provider.get("label") or "")
+        elif isinstance(provider, str):
+            provider_id = provider
+        else:
+            provider_id = ""
+
+        latency_ms: float | None = None
+        for key in ("latencyMs", "latency_ms", "tokensPerSecond"):
+            raw_latency = case.get(key)
+            if isinstance(raw_latency, (int, float)):
+                latency_ms = float(raw_latency)
+                break
+
+        score = case.get("score")
+        normalized_cases.append(
+            {
+                "index": index,
+                "input": input_text,
+                "output": output_text,
+                "passed": success,
+                "provider": provider_id,
+                "latency_ms": latency_ms,
+                "score": score if isinstance(score, (int, float)) else None,
+            }
+        )
+
+    failed = len(normalized_cases) - passed
+    pass_rate = round((passed / len(normalized_cases)) * 100, 2) if normalized_cases else 0.0
+
+    return {
+        "schema": "vex-eval/v1",
+        "adapter": "promptfoo",
+        "mode": "promptfoo",
+        "command": command,
+        "config": str(config_path),
+        "dataset": str(dataset_path),
+        "dataset_case_count": len(normalized_cases),
+        "passed": passed,
+        "failed": failed,
+        "pass_rate": pass_rate,
+        "results": normalized_cases,
+    }
+
+
+def run_eval_promptfoo_adapter(
+    root: Path,
+    config_path: Path,
+    dataset_path: Path,
+    out_path: Path,
+    *,
+    timeout: float,
+    emit_json: bool,
+    min_pass_rate: float | None,
+) -> int:
+    """Delegate to a locally discovered ``promptfoo`` binary."""
+    binary = _promptfoo_binary()
+    if binary is None:
+        print(
+            "vex eval promptfoo adapter requires 'uvx' or 'promptfoo' on PATH. "
+            "Install uv (https://docs.astral.sh/uv/) or pass --no-promptfoo to "
+            "use the Python harness."
+        )
+        return 127
+    command_list, runner_name = binary
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".json", prefix="vex-promptfoo-", delete=False
+    ) as tmp_file:
+        tmp_output = Path(tmp_file.name)
+
+    try:
+        argv = [
+            *command_list,
+            "eval",
+            "-c",
+            str(config_path),
+            "--output",
+            str(tmp_output),
+        ]
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"promptfoo adapter timed out after {timeout}s "
+                f"(runner={runner_name}). Increase --timeout if needed."
+            )
+            return 124
+        except FileNotFoundError:
+            print(f"promptfoo adapter failed: {runner_name} not found")
+            return 127
+
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+
+        raw_report: dict[str, Any] = {}
+        if tmp_output.exists():
+            raw_text = tmp_output.read_text(encoding="utf-8")
+            if raw_text.strip():
+                try:
+                    parsed = json.loads(raw_text)
+                    if isinstance(parsed, dict):
+                        raw_report = parsed
+                except json.JSONDecodeError:
+                    raw_report = {}
+    finally:
+        try:
+            tmp_output.unlink()
+        except OSError:
+            pass
+
+    if completed.returncode != 0 and not raw_report:
+        # Surface subprocess output clearly so CI logs are actionable.
+        if stdout.strip():
+            print(stdout.rstrip())
+        if stderr.strip():
+            print(stderr.rstrip(), file=sys.stderr)
+        print(
+            f"promptfoo exited with code {completed.returncode} "
+            f"(runner={runner_name})"
+        )
+        return completed.returncode if completed.returncode != 0 else 1
+
+    report = normalize_promptfoo_report(
+        raw_report,
+        command=f"{runner_name} promptfoo",
+        dataset_path=dataset_path,
+        config_path=config_path,
+    )
+
+    _emit_eval_report(report, out_path, emit_json)
+    if not emit_json:
+        print(f"Eval report written to {out_path}")
+        print(
+            f"adapter=promptfoo passed={report['passed']} failed={report['failed']} "
+            f"pass_rate={report['pass_rate']}%"
+        )
+
+    exit_code = completed.returncode
+    if exit_code == 0 and report["failed"] > 0:
+        exit_code = 1
+    return _apply_min_pass_rate(report, min_pass_rate, exit_code)
+
+
+def run_eval_harness(
+    root: Path,
+    command: str,
+    dataset_path: Path,
+    out_path: Path,
+    *,
+    emit_json: bool = False,
+    min_pass_rate: float | None = None,
+) -> int:
     uv = uv_bin()
     if uv is None:
         print("vex eval requires 'uv' on PATH")
@@ -1350,6 +1619,7 @@ def run_eval_harness(root: Path, command: str, dataset_path: Path, out_path: Pat
 
     report = {
         "schema": "vex-eval/v1",
+        "adapter": "harness",
         "command": command,
         "dataset": str(dataset_path),
         "dataset_exists": dataset_exists,
@@ -1357,13 +1627,18 @@ def run_eval_harness(root: Path, command: str, dataset_path: Path, out_path: Pat
         "exit_code": code,
         "duration_ms": elapsed_ms,
         "status": "passed" if code == 0 else "failed",
+        "passed": case_count if code == 0 else 0,
+        "failed": 0 if code == 0 else case_count,
+        "pass_rate": 100.0 if code == 0 else 0.0,
+        "results": [],
     }
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"Eval report written to {out_path}")
-    print(f"status={report['status']} duration={elapsed_ms}ms cases={case_count}")
-    return 0 if code == 0 else 1
+    _emit_eval_report(report, out_path, emit_json)
+    if not emit_json:
+        print(f"Eval report written to {out_path}")
+        print(f"status={report['status']} duration={elapsed_ms}ms cases={case_count}")
+    exit_code = 0 if code == 0 else 1
+    return _apply_min_pass_rate(report, min_pass_rate, exit_code)
 
 
 def load_eval_cases(dataset_path: Path) -> list[dict[str, Any]]:
@@ -1382,7 +1657,15 @@ def load_eval_cases(dataset_path: Path) -> list[dict[str, Any]]:
     return cases
 
 
-def run_eval_per_case_harness(root: Path, command: str, dataset_path: Path, out_path: Path) -> int:
+def run_eval_per_case_harness(
+    root: Path,
+    command: str,
+    dataset_path: Path,
+    out_path: Path,
+    *,
+    emit_json: bool = False,
+    min_pass_rate: float | None = None,
+) -> int:
     uv = uv_bin()
     if uv is None:
         print("vex eval requires 'uv' on PATH")
@@ -1459,6 +1742,7 @@ def run_eval_per_case_harness(root: Path, command: str, dataset_path: Path, out_
 
     report = {
         "schema": "vex-eval/v1",
+        "adapter": "harness",
         "mode": "per-case",
         "command": command,
         "dataset": str(dataset_path),
@@ -1469,11 +1753,15 @@ def run_eval_per_case_harness(root: Path, command: str, dataset_path: Path, out_
         "results": results,
     }
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(f"Eval report written to {out_path}")
-    print(f"mode=per-case passed={report['passed']} failed={report['failed']} pass_rate={report['pass_rate']}%")
-    return 0 if report["failed"] == 0 else 1
+    _emit_eval_report(report, out_path, emit_json)
+    if not emit_json:
+        print(f"Eval report written to {out_path}")
+        print(
+            f"mode=per-case passed={report['passed']} failed={report['failed']} "
+            f"pass_rate={report['pass_rate']}%"
+        )
+    exit_code = 0 if report["failed"] == 0 else 1
+    return _apply_min_pass_rate(report, min_pass_rate, exit_code)
 
 
 def docker_like_bin() -> str | None:
@@ -1896,6 +2184,31 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--dataset", default="evals/datasets/cases.jsonl")
     eval_parser.add_argument("--out", default="artifacts/evals/latest.json")
     eval_parser.add_argument("--per-case", action="store_true")
+    eval_parser.add_argument(
+        "--json",
+        dest="emit_json",
+        action="store_true",
+        help="Print the normalized report JSON to stdout (suppresses the human summary).",
+    )
+    eval_parser.add_argument(
+        "--min-pass-rate",
+        dest="min_pass_rate",
+        type=float,
+        default=None,
+        help="Fail the run when pass_rate falls below this fraction (0.0-1.0).",
+    )
+    eval_parser.add_argument(
+        "--no-promptfoo",
+        dest="no_promptfoo",
+        action="store_true",
+        help="Force the built-in Python harness even if promptfooconfig.yaml exists.",
+    )
+    eval_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Timeout (seconds) for the promptfoo subprocess (default: 300).",
+    )
     eval_parser.add_argument("args", nargs=argparse.REMAINDER)
     eval_parser.set_defaults(handler=handle_eval)
 
@@ -2096,6 +2409,62 @@ def handle_benchmark(args: argparse.Namespace) -> int:
 
 def handle_eval(args: argparse.Namespace) -> int:
     root = project_root()
+    eval_config = load_vex_eval_config(root)
+
+    # --min-pass-rate: CLI flag wins, pyproject is the fallback default.
+    min_pass_rate: float | None = args.min_pass_rate
+    if min_pass_rate is None:
+        configured = eval_config.get("min_pass_rate")
+        if isinstance(configured, (int, float)):
+            min_pass_rate = float(configured)
+    if min_pass_rate is not None:
+        if min_pass_rate < 0.0 or min_pass_rate > 1.0:
+            print(
+                "--min-pass-rate must be a fraction between 0.0 and 1.0 "
+                f"(got {min_pass_rate})"
+            )
+            return 2
+
+    # Adapter selection precedence:
+    # 1. explicit --command -> always use harness
+    # 2. --no-promptfoo CLI flag -> always use harness
+    # 3. [tool.vex.eval].adapter = "harness" | "promptfoo" | "auto"
+    # 4. "auto": delegate when promptfooconfig.yaml is present
+    adapter_setting = str(eval_config.get("adapter", "auto")).lower()
+    if adapter_setting not in {"auto", "promptfoo", "harness"}:
+        adapter_setting = "auto"
+
+    explicit_command = args.command is not None
+    use_promptfoo = False
+    config_path: Path | None = None
+
+    if not explicit_command and not args.no_promptfoo:
+        if adapter_setting == "promptfoo":
+            config_path = detect_promptfoo_config(root)
+            if config_path is None:
+                print(
+                    "vex eval adapter='promptfoo' but no promptfooconfig.yaml "
+                    "was found at the project root"
+                )
+                return 2
+            use_promptfoo = True
+        elif adapter_setting == "auto":
+            config_path = detect_promptfoo_config(root)
+            use_promptfoo = config_path is not None
+
+    if use_promptfoo and config_path is not None:
+        dataset_path = root / args.dataset
+        out_path = root / args.out
+        return run_eval_promptfoo_adapter(
+            root,
+            config_path=config_path,
+            dataset_path=dataset_path,
+            out_path=out_path,
+            timeout=max(1.0, float(args.timeout)),
+            emit_json=bool(args.emit_json),
+            min_pass_rate=min_pass_rate,
+        )
+
     command = args.command
     if command is None:
         command = resolve_optional_script_command("eval", root)
@@ -2109,8 +2478,22 @@ def handle_eval(args: argparse.Namespace) -> int:
     dataset_path = root / args.dataset
     out_path = root / args.out
     if args.per_case:
-        return run_eval_per_case_harness(root, command, dataset_path=dataset_path, out_path=out_path)
-    return run_eval_harness(root, command, dataset_path=dataset_path, out_path=out_path)
+        return run_eval_per_case_harness(
+            root,
+            command,
+            dataset_path=dataset_path,
+            out_path=out_path,
+            emit_json=bool(args.emit_json),
+            min_pass_rate=min_pass_rate,
+        )
+    return run_eval_harness(
+        root,
+        command,
+        dataset_path=dataset_path,
+        out_path=out_path,
+        emit_json=bool(args.emit_json),
+        min_pass_rate=min_pass_rate,
+    )
 
 
 def handle_policy(args: argparse.Namespace) -> int:
