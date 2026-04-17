@@ -1768,7 +1768,14 @@ def docker_like_bin() -> str | None:
     return shutil.which("docker") or shutil.which("podman")
 
 
-def deploy_docker(root: Path, image: str, tag: str, push: bool) -> int:
+def deploy_docker(
+    root: Path,
+    image: str,
+    tag: str,
+    push: bool,
+    run_container: bool = False,
+    port: int | None = None,
+) -> int:
     tool = docker_like_bin()
     if tool is None:
         print("No docker-compatible CLI found (docker or podman)")
@@ -1780,8 +1787,179 @@ def deploy_docker(root: Path, image: str, tag: str, push: bool) -> int:
         return build_code
 
     if push:
-        return run_command([tool, "push", full_image], cwd=root)
+        push_code = run_command([tool, "push", full_image], cwd=root)
+        if push_code != 0:
+            return push_code
+        print(f"Pushed image {full_image}")
+
+    if run_container:
+        mapped_port = port if port is not None else 8000
+        port_mapping = f"{mapped_port}:{mapped_port}"
+        run_code = run_command(
+            [tool, "run", "--rm", "-p", port_mapping, full_image],
+            cwd=root,
+        )
+        if run_code != 0:
+            return run_code
+        print(f"Ran image {full_image} on port {mapped_port}")
+        return 0
+
     print(f"Built image {full_image}")
+    return 0
+
+
+def _stringify(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def profile_value(
+    profile: dict[str, Any],
+    *keys: str,
+    default: Any = None,
+) -> Any:
+    """Return the first matching key from the profile, supporting aliases."""
+    for key in keys:
+        if key in profile:
+            return profile[key]
+    return default
+
+
+def parse_modal_url(output: str) -> str | None:
+    """Extract a deployed URL from modal CLI output.
+
+    Modal prints lines like ``View app at https://example--demo-app.modal.run``
+    or ``✓ Created web endpoint => https://...modal.run``.
+    """
+    if not output:
+        return None
+    pattern = re.compile(r"https?://[^\s'\"<>]+\.modal\.run[^\s'\"<>]*")
+    match = pattern.search(output)
+    if match:
+        return match.group(0).rstrip(".,)")
+    return None
+
+
+def parse_cloud_run_url(output: str) -> str | None:
+    """Extract a deployed service URL from gcloud run deploy output."""
+    if not output:
+        return None
+    pattern = re.compile(r"https?://[A-Za-z0-9.\-]+\.run\.app[^\s'\"<>]*")
+    match = pattern.search(output)
+    if match:
+        return match.group(0).rstrip(".,)")
+    return None
+
+
+def deploy_modal(root: Path, scaffold_path: Path) -> int:
+    if shutil.which("modal") is None:
+        print("modal CLI not found", file=sys.stderr)
+        return 127
+    code, stdout, stderr = run_command_capture(
+        ["modal", "deploy", str(scaffold_path)],
+        cwd=root,
+    )
+    if stdout:
+        sys.stdout.write(stdout)
+        if not stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(stderr)
+        if not stderr.endswith("\n"):
+            sys.stderr.write("\n")
+    if code != 0:
+        print(f"modal deploy failed with exit code {code}", file=sys.stderr)
+        return code
+    combined = (stdout or "") + "\n" + (stderr or "")
+    url = parse_modal_url(combined)
+    if url:
+        print(f"Deployed: {url}")
+    else:
+        print("Deployed (no URL detected in modal output)")
+    return 0
+
+
+def deploy_cloud_run(
+    root: Path,
+    service: str,
+    region: str,
+    image: str,
+    tag: str,
+    project: str | None,
+    profile: dict[str, Any],
+) -> int:
+    if shutil.which("gcloud") is None:
+        print("gcloud CLI not found", file=sys.stderr)
+        return 127
+
+    full_image = f"{image}:{tag}"
+
+    build_argv = ["gcloud", "builds", "submit", "--tag", full_image]
+    if project:
+        build_argv.extend(["--project", project])
+    build_code = run_command(build_argv, cwd=root)
+    if build_code != 0:
+        print(f"gcloud builds submit failed with exit code {build_code}", file=sys.stderr)
+        return build_code
+
+    deploy_argv: list[str] = [
+        "gcloud",
+        "run",
+        "deploy",
+        service,
+        "--image",
+        full_image,
+        "--region",
+        region,
+        "--format",
+        "value(status.url)",
+        "--quiet",
+    ]
+    if project:
+        deploy_argv.extend(["--project", project])
+
+    memory = _stringify(profile_value(profile, "memory"))
+    if memory:
+        deploy_argv.extend(["--memory", memory])
+    cpu = _stringify(profile_value(profile, "cpu"))
+    if cpu:
+        deploy_argv.extend(["--cpu", cpu])
+    min_instances = _stringify(profile_value(profile, "min_instances", "min-instances"))
+    if min_instances:
+        deploy_argv.extend(["--min-instances", min_instances])
+    max_instances = _stringify(profile_value(profile, "max_instances", "max-instances"))
+    if max_instances:
+        deploy_argv.extend(["--max-instances", max_instances])
+    service_account = _stringify(
+        profile_value(profile, "service_account", "service-account")
+    )
+    if service_account:
+        deploy_argv.extend(["--service-account", service_account])
+    allow_unauthenticated = profile_value(profile, "allow_unauthenticated", "allow-unauthenticated")
+    if isinstance(allow_unauthenticated, bool):
+        deploy_argv.append("--allow-unauthenticated" if allow_unauthenticated else "--no-allow-unauthenticated")
+
+    code, stdout, stderr = run_command_capture(deploy_argv, cwd=root)
+    if stdout:
+        sys.stdout.write(stdout)
+        if not stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(stderr)
+        if not stderr.endswith("\n"):
+            sys.stderr.write("\n")
+    if code != 0:
+        print(f"gcloud run deploy failed with exit code {code}", file=sys.stderr)
+        return code
+
+    url = parse_cloud_run_url((stdout or "") + "\n" + (stderr or ""))
+    if url:
+        print(f"Deployed: {url}")
+    else:
+        print(f"Deployed service {service} (no URL detected in gcloud output)")
     return 0
 
 
@@ -2041,10 +2219,13 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--push", action="store_true")
     deploy_parser.add_argument("--service", default="vex-ai-service")
     deploy_parser.add_argument("--region", default="us-central1")
+    deploy_parser.add_argument("--project", default=None)
     deploy_parser.add_argument("--app-name", default="vex-ai-app")
     deploy_parser.add_argument("--apply", action="store_true")
     deploy_parser.add_argument("--run", action="store_true")
+    deploy_parser.add_argument("--port", type=int, default=None)
     deploy_parser.add_argument("--profile", default="default")
+    deploy_parser.add_argument("--skip-preflight", action="store_true")
     deploy_parser.add_argument("--for", dest="check_target", choices=["all", "docker", "cloud-run", "modal"], default="all")
     deploy_parser.set_defaults(handler=handle_deploy)
 
@@ -2405,17 +2586,47 @@ def handle_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_value_is_explicit(args: argparse.Namespace, flag_name: str, default: Any) -> bool:
+    """Best-effort check: was a CLI flag explicitly set by the user?"""
+    value = getattr(args, flag_name, default)
+    return value != default
+
+
+def _resolve_setting(
+    args: argparse.Namespace,
+    profile: dict[str, Any],
+    cli_attr: str,
+    cli_default: Any,
+    *profile_keys: str,
+) -> Any:
+    """Profile precedence: CLI flag (if explicit) > profile value > CLI default."""
+    if _cli_value_is_explicit(args, cli_attr, cli_default):
+        return getattr(args, cli_attr)
+    for key in profile_keys:
+        if key in profile:
+            return profile[key]
+    return getattr(args, cli_attr, cli_default)
+
+
 def handle_deploy(args: argparse.Namespace) -> int:
     root = project_root()
     config = load_deploy_targets(root)
     profile = resolve_deploy_profile(config, args.profile)
 
-    image = str(profile.get("image", args.image))
-    tag = str(profile.get("tag", args.tag))
-    service = str(profile.get("service", args.service))
-    region = str(profile.get("region", args.region))
-    app_name = str(profile.get("app_name", args.app_name))
-    push = bool(profile.get("push", args.push))
+    image = str(_resolve_setting(args, profile, "image", "vex-app", "image"))
+    tag = str(_resolve_setting(args, profile, "tag", "latest", "tag"))
+    service = str(_resolve_setting(args, profile, "service", "vex-ai-service", "service"))
+    region = str(_resolve_setting(args, profile, "region", "us-central1", "region"))
+    app_name = str(
+        _resolve_setting(args, profile, "app_name", "vex-ai-app", "app_name", "app-name")
+    )
+    push = bool(_resolve_setting(args, profile, "push", False, "push"))
+
+    project_raw = _resolve_setting(args, profile, "project", None, "project")
+    project = str(project_raw) if project_raw else None
+
+    port_raw = _resolve_setting(args, profile, "port", None, "port")
+    port = int(port_raw) if port_raw is not None else None
 
     if args.target == "check":
         issues, lines = deploy_preflight(root, target=args.check_target, profile=profile)
@@ -2423,27 +2634,50 @@ def handle_deploy(args: argparse.Namespace) -> int:
             print(line)
         return 0 if issues == 0 else 1
 
+    # Run preflight when we're about to actually hit external systems.
+    if (args.apply or args.run) and not args.skip_preflight:
+        preflight_target = args.target if args.target in {"docker", "cloud-run", "modal"} else "all"
+        issues, lines = deploy_preflight(root, target=preflight_target, profile=profile)
+        for line in lines:
+            print(line)
+        if issues > 0:
+            print(
+                f"Preflight reported {issues} issue(s); aborting. "
+                "Re-run 'vex deploy check' or pass --skip-preflight to override.",
+                file=sys.stderr,
+            )
+            return 1
+
     if args.target == "docker":
-        return deploy_docker(root, image=image, tag=tag, push=push)
+        return deploy_docker(
+            root,
+            image=image,
+            tag=tag,
+            push=push,
+            run_container=bool(args.run),
+            port=port,
+        )
 
     if args.target == "cloud-run":
         path = scaffold_cloud_run(root, service=service, region=region, image=image, tag=tag)
         print(f"Wrote Cloud Run scaffold to {path}")
         if args.apply:
-            if shutil.which("gcloud") is None:
-                print("gcloud CLI not found")
-                return 127
-            return run_command(["gcloud", "run", "services", "replace", str(path), "--region", region], cwd=root)
+            return deploy_cloud_run(
+                root,
+                service=service,
+                region=region,
+                image=image,
+                tag=tag,
+                project=project,
+                profile=profile,
+            )
         return 0
 
     if args.target == "modal":
         path = scaffold_modal(root, app_name=app_name)
         print(f"Wrote Modal scaffold to {path}")
         if args.run:
-            if shutil.which("modal") is None:
-                print("modal CLI not found")
-                return 127
-            return run_command(["modal", "deploy", str(path)], cwd=root)
+            return deploy_modal(root, scaffold_path=path)
         return 0
 
     print("Unsupported deploy target")

@@ -69,7 +69,7 @@ Every verb is a thin wrapper. Escape hatches everywhere — if you want `uv run 
   { "schema_version": "v1", "runtime": "vex-ai-runtime",
     "engine": "onnxruntime", "model_path": "models/model.onnx" }
   ```
-- `vex deploy docker|cloud-run|modal [--apply|--run]` — scaffold + execute; profile inheritance (`inherit = "default"`) and env interpolation (`${VEX_IMAGE_REPO}`)
+- `vex deploy docker|cloud-run|modal [--apply|--run]` — scaffold + ship end-to-end; `docker --run` builds and runs locally, `cloud-run --apply` runs `gcloud builds submit` then `gcloud run deploy` and echoes the service URL, `modal --run` invokes `modal deploy` and surfaces the `*.modal.run` URL. Profile inheritance (`inherit = "default"`), env interpolation (`${VEX_IMAGE_REPO}`), and Cloud Run profile fields (`project`, `memory`, `cpu`, `min_instances`, `max_instances`, `service_account`, `allow_unauthenticated`). Preflight runs automatically on `--apply`/`--run` (override with `--skip-preflight`).
 - `vex deploy check [--for all|docker|cloud-run|modal]` — preflight
 - `vex schema validate-model [artifact_dir]` — verify a packaged artifact
 - `vex doctor ai` — 13-check readiness report
@@ -104,7 +104,6 @@ The roadmap ([`docs/roadmap.md`](docs/roadmap.md)) and product boundary ([`docs/
 
 - `vex dev` upgraded to a real dev loop: [`watchfiles`](https://watchfiles.helpmanual.io) hot reload + local ollama fallback + inline trace tail
 - `vex eval` adapters for promptfoo and deepeval, with `--json` CI output and pass-rate gates
-- `vex deploy modal|cloud-run` as full end-to-end deployments, not just scaffolding
 - `vex doctor ai` extended to verify ollama availability, model reachability, eval dataset shape, deploy profile env vars
 - More opinionated `examples/` tree with runnable agents, inference APIs, and local RAG
 
