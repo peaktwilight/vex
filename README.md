@@ -117,7 +117,8 @@ Under the hood:
 - `tests/`: lightweight CLI tests
 - `docs/architecture.md`: integration choices and non-goals
 - `docs/roadmap.md`: command surface and phased plan
-- `../vex-ai-runtime/`: separate runtime repo for native execution and secure model packaging
+- `engine/vex-ai-runtime/`: embedded runtime engine for native execution and secure model packaging
+- `.github/workflows/ci.yml`: CI for CLI + runtime tests
 
 ## Running The Prototype
 
@@ -143,6 +144,14 @@ PYTHONPATH=src python3 -m unittest discover -s tests
 ```
 
 `vex` currently requires `uv` to be installed and available on `PATH`.
+
+You can run all monorepo tests with:
+
+```bash
+make test
+```
+
+See `CONTRIBUTING.md` for development workflow details.
 
 The current codebase is still in transition from generic workflow bootstrap toward the AI-native direction above.
 

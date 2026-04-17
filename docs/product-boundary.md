@@ -70,7 +70,7 @@ These defaults are intentionally pragmatic and local-first.
 During rapid iteration, a monorepo is recommended:
 
 - `vex/` (CLI and workflow control plane)
-- `vex-ai-runtime/` (native runtime and schema validation)
+- `engine/vex-ai-runtime/` (native runtime and schema validation)
 
 This keeps schema, packaging, and compatibility changes synchronized.
 

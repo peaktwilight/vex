@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  vex-tests:
+    name: Vex Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run vex unit tests
+        run: PYTHONPATH=src python -m unittest discover -s tests
+
+  runtime-python-tests:
+    name: Runtime Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run runtime Python tests
+        run: python -m unittest discover -s tests
+        working-directory: engine/vex-ai-runtime
+
+  runtime-rust-tests:
+    name: Runtime Rust Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run runtime Rust tests
+        run: cargo test
+        working-directory: engine/vex-ai-runtime
