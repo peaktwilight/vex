@@ -1372,21 +1372,27 @@ def sandbox_backend(policy: dict[str, Any]) -> str:
     return "none"
 
 
-def run_sandboxed(command: str, root: Path, policy: dict[str, Any]) -> int:
+def build_sandbox_argv(
+    command: str, root: Path, policy: dict[str, Any]
+) -> list[str] | None:
+    """Return the sandbox argv for ``command`` under ``policy``.
+
+    Produces the full ``[backend, "run", "--rm", ..., image, "sh", "-c",
+    command]`` invocation used by ``vex run --sandbox`` and ``vex eval
+    --policy``. Returns ``None`` when no sandbox backend is available
+    (``sandbox_backend()`` resolves to ``"none"``); callers decide how to
+    handle fallback (unsafe local execution or hard-fail).
+    """
     backend = sandbox_backend(policy)
     if backend == "none":
-        if bool(policy.get("unsafe_fallback", False)):
-            print("WARN sandbox backend unavailable; using unsafe local execution")
-            return run_command(["sh", "-c", command], cwd=root)
-        print("No sandbox backend available. Install podman or docker, or set policy unsafe_fallback=true")
-        return 2
+        return None
 
     image = str(policy.get("sandbox_image", "python:3.12-slim"))
     network_mode = "none" if str(policy.get("network", "deny")) == "deny" else "bridge"
     memory_mb = int(policy.get("sandbox_memory_mb", 1024))
     pids_limit = int(policy.get("sandbox_pids_limit", 128))
 
-    container_cmd = [
+    return [
         backend,
         "run",
         "--rm",
@@ -1410,7 +1416,67 @@ def run_sandboxed(command: str, root: Path, policy: dict[str, Any]) -> int:
         "-c",
         command,
     ]
+
+
+def run_sandboxed(command: str, root: Path, policy: dict[str, Any]) -> int:
+    container_cmd = build_sandbox_argv(command, root, policy)
+    if container_cmd is None:
+        if bool(policy.get("unsafe_fallback", False)):
+            print("WARN sandbox backend unavailable; using unsafe local execution")
+            return run_command(["sh", "-c", command], cwd=root)
+        print("No sandbox backend available. Install podman or docker, or set policy unsafe_fallback=true")
+        return 2
     return run_command(container_cmd)
+
+
+def policy_snapshot(
+    policy: dict[str, Any], *, enforced: bool, unsafe_fallback_applied: bool
+) -> dict[str, Any]:
+    """Produce the ``policy`` block stamped into ``vex eval --policy`` reports."""
+    return {
+        "enforced": enforced,
+        "network": str(policy.get("network", "deny")),
+        "filesystem": str(policy.get("filesystem", "project")),
+        "sandbox_backend": sandbox_backend(policy),
+        "sandbox_image": str(policy.get("sandbox_image", "python:3.12-slim")),
+        "sandbox_memory_mb": int(policy.get("sandbox_memory_mb", 1024)),
+        "sandbox_pids_limit": int(policy.get("sandbox_pids_limit", 128)),
+        "unsafe_fallback_applied": unsafe_fallback_applied,
+    }
+
+
+def resolve_eval_sandbox(
+    root: Path, policy: dict[str, Any]
+) -> tuple[list[str] | None, bool, int]:
+    """Resolve sandbox argv prefix and fallback state for eval adapters.
+
+    Returns a tuple ``(sandbox_prefix, unsafe_fallback_applied, exit_code)``:
+
+    - If a sandbox backend is available: ``(sandbox_prefix, False, 0)`` where
+      ``sandbox_prefix`` is everything up to and including the image slot (the
+      caller appends ``"sh", "-c", command`` or reuses ``build_sandbox_argv``).
+    - If no backend is available but ``unsafe_fallback = true``: ``(None,
+      True, 0)`` — the caller should run locally.
+    - Otherwise: ``(None, False, 2)`` — hard-fail; caller should surface the
+      message already printed and return the exit code.
+    """
+    backend = sandbox_backend(policy)
+    if backend != "none":
+        # Returning a marker prefix keeps the API aligned with callers that
+        # will call build_sandbox_argv() with their final command string.
+        return [backend], False, 0
+    if bool(policy.get("unsafe_fallback", False)):
+        print(
+            "WARN sandbox backend unavailable; running eval without sandbox "
+            "enforcement (unsafe_fallback=true)"
+        )
+        return None, True, 0
+    print(
+        "vex eval --policy requires a sandbox backend (podman or docker). "
+        "Run 'vex doctor ai' to diagnose, or set "
+        "[tool.vex.policy].unsafe_fallback = true to allow running unsandboxed."
+    )
+    return None, False, 2
 
 
 def benchmark_shell_command(root: Path, explicit_command: str | None, extra_args: Sequence[str]) -> str:
@@ -1484,6 +1550,23 @@ def _emit_eval_report(report: dict[str, Any], out_path: Path, emit_json: bool) -
     out_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if emit_json:
         print(json.dumps(report))
+
+
+def _stamp_policy_snapshot(
+    report: dict[str, Any],
+    *,
+    policy: dict[str, Any] | None,
+    enforced: bool,
+    unsafe_fallback_applied: bool,
+) -> None:
+    """Attach a ``policy`` block to ``report`` in place when policy is active."""
+    if policy is None:
+        return
+    report["policy"] = policy_snapshot(
+        policy,
+        enforced=enforced,
+        unsafe_fallback_applied=unsafe_fallback_applied,
+    )
 
 
 def _apply_min_pass_rate(report: dict[str, Any], threshold: float | None, exit_code: int) -> int:
@@ -1625,6 +1708,8 @@ def run_eval_promptfoo_adapter(
     timeout: float,
     emit_json: bool,
     min_pass_rate: float | None,
+    policy: dict[str, Any] | None = None,
+    unsafe_fallback_applied: bool = False,
 ) -> int:
     """Delegate to a locally discovered ``promptfoo`` binary."""
     binary = _promptfoo_binary()
@@ -1643,7 +1728,7 @@ def run_eval_promptfoo_adapter(
         tmp_output = Path(tmp_file.name)
 
     try:
-        argv = [
+        inner_argv = [
             *command_list,
             "eval",
             "-c",
@@ -1651,6 +1736,30 @@ def run_eval_promptfoo_adapter(
             "--output",
             str(tmp_output),
         ]
+        # When --policy is active AND a sandbox backend is available, wrap the
+        # whole uvx/promptfoo invocation inside the declared sandbox. We ship
+        # uv into the default python:3.12-slim image via a pip-install shim so
+        # ``uvx promptfoo`` can resolve. Follow-up: vex/sandbox-eval:latest
+        # image with uv pre-baked (see issue #33 for the TODO).
+        if policy is not None and not unsafe_fallback_applied:
+            inner_cmd = " ".join(shlex.quote(part) for part in inner_argv)
+            if runner_name == "uvx":
+                shim = "command -v uvx >/dev/null 2>&1 || pip install --quiet uv"
+                shell_cmd = f"{shim} && {inner_cmd}"
+            else:
+                shell_cmd = inner_cmd
+            container_argv = build_sandbox_argv(shell_cmd, root, policy)
+            if container_argv is None:
+                # resolve_eval_sandbox() already validated backend presence;
+                # reaching here means state changed underneath us.
+                print(
+                    "vex eval --policy lost its sandbox backend between "
+                    "resolution and adapter launch."
+                )
+                return 2
+            argv = container_argv
+        else:
+            argv = inner_argv
         try:
             completed = subprocess.run(
                 argv,
@@ -1706,6 +1815,13 @@ def run_eval_promptfoo_adapter(
         command=f"{runner_name} promptfoo",
         dataset_path=dataset_path,
         config_path=config_path,
+    )
+
+    _stamp_policy_snapshot(
+        report,
+        policy=policy,
+        enforced=policy is not None and not unsafe_fallback_applied,
+        unsafe_fallback_applied=unsafe_fallback_applied,
     )
 
     _emit_eval_report(report, out_path, emit_json)
@@ -1934,6 +2050,8 @@ def run_eval_inspect_adapter(
     timeout: float,
     emit_json: bool,
     min_pass_rate: float | None,
+    policy: dict[str, Any] | None = None,
+    unsafe_fallback_applied: bool = False,
 ) -> int:
     """Delegate to a locally discovered Inspect AI CLI.
 
@@ -1952,7 +2070,7 @@ def run_eval_inspect_adapter(
 
     tmp_log_dir = Path(tempfile.mkdtemp(prefix="vex-inspect-"))
     try:
-        argv = [
+        inner_argv = [
             *command_list,
             "eval",
             str(config_path),
@@ -1961,6 +2079,25 @@ def run_eval_inspect_adapter(
             "--log-format",
             "json",
         ]
+        # Mirror promptfoo: wrap the whole uvx/inspect invocation inside the
+        # declared sandbox when --policy is active.
+        if policy is not None and not unsafe_fallback_applied:
+            inner_cmd = " ".join(shlex.quote(part) for part in inner_argv)
+            if runner_name == "uvx":
+                shim = "command -v uvx >/dev/null 2>&1 || pip install --quiet uv"
+                shell_cmd = f"{shim} && {inner_cmd}"
+            else:
+                shell_cmd = inner_cmd
+            container_argv = build_sandbox_argv(shell_cmd, root, policy)
+            if container_argv is None:
+                print(
+                    "vex eval --policy lost its sandbox backend between "
+                    "resolution and adapter launch."
+                )
+                return 2
+            argv = container_argv
+        else:
+            argv = inner_argv
         try:
             completed = subprocess.run(
                 argv,
@@ -2025,6 +2162,13 @@ def run_eval_inspect_adapter(
         config_path=config_path,
     )
 
+    _stamp_policy_snapshot(
+        report,
+        policy=policy,
+        enforced=policy is not None and not unsafe_fallback_applied,
+        unsafe_fallback_applied=unsafe_fallback_applied,
+    )
+
     _emit_eval_report(report, out_path, emit_json)
     if not emit_json:
         print(f"Eval report written to {out_path}")
@@ -2047,6 +2191,8 @@ def run_eval_harness(
     *,
     emit_json: bool = False,
     min_pass_rate: float | None = None,
+    policy: dict[str, Any] | None = None,
+    unsafe_fallback_applied: bool = False,
 ) -> int:
     uv = uv_bin()
     if uv is None:
@@ -2059,7 +2205,17 @@ def run_eval_harness(
         case_count = sum(1 for line in dataset_path.read_text(encoding="utf-8").splitlines() if line.strip())
 
     started = time.perf_counter()
-    code = run_command([uv, "run", "sh", "-c", command], cwd=root)
+    if policy is not None and not unsafe_fallback_applied:
+        container_argv = build_sandbox_argv(command, root, policy)
+        if container_argv is None:
+            print(
+                "vex eval --policy lost its sandbox backend between resolution "
+                "and harness launch."
+            )
+            return 2
+        code = run_command(container_argv)
+    else:
+        code = run_command([uv, "run", "sh", "-c", command], cwd=root)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
 
     report = {
@@ -2077,6 +2233,13 @@ def run_eval_harness(
         "pass_rate": 100.0 if code == 0 else 0.0,
         "results": [],
     }
+
+    _stamp_policy_snapshot(
+        report,
+        policy=policy,
+        enforced=policy is not None and not unsafe_fallback_applied,
+        unsafe_fallback_applied=unsafe_fallback_applied,
+    )
 
     _emit_eval_report(report, out_path, emit_json)
     if not emit_json:
@@ -2110,6 +2273,8 @@ def run_eval_per_case_harness(
     *,
     emit_json: bool = False,
     min_pass_rate: float | None = None,
+    policy: dict[str, Any] | None = None,
+    unsafe_fallback_applied: bool = False,
 ) -> int:
     uv = uv_bin()
     if uv is None:
@@ -2120,6 +2285,8 @@ def run_eval_per_case_harness(
     results: list[dict[str, Any]] = []
     passed = 0
 
+    sandboxed = policy is not None and not unsafe_fallback_applied
+
     for index, case in enumerate(cases, start=1):
         input_text = str(case.get("input", ""))
         if "{input}" in command:
@@ -2128,7 +2295,20 @@ def run_eval_per_case_harness(
             case_command = f"{command} {shlex.quote(input_text)}" if input_text else command
 
         started = time.perf_counter()
-        code, stdout, stderr = run_command_capture([uv, "run", "sh", "-c", case_command], cwd=root)
+        if sandboxed:
+            assert policy is not None  # narrow for mypy
+            container_argv = build_sandbox_argv(case_command, root, policy)
+            if container_argv is None:
+                print(
+                    "vex eval --policy lost its sandbox backend between "
+                    "resolution and harness launch."
+                )
+                return 2
+            code, stdout, stderr = run_command_capture(container_argv)
+        else:
+            code, stdout, stderr = run_command_capture(
+                [uv, "run", "sh", "-c", case_command], cwd=root
+            )
         elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
 
         expect_contains = case.get("expect_contains")
@@ -2197,6 +2377,13 @@ def run_eval_per_case_harness(
         "pass_rate": round((passed / len(cases)) * 100, 2) if cases else 0.0,
         "results": results,
     }
+
+    _stamp_policy_snapshot(
+        report,
+        policy=policy,
+        enforced=policy is not None and not unsafe_fallback_applied,
+        unsafe_fallback_applied=unsafe_fallback_applied,
+    )
 
     _emit_eval_report(report, out_path, emit_json)
     if not emit_json:
@@ -2677,6 +2864,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=300.0,
         help="Timeout (seconds) for the adapter subprocess (default: 300).",
     )
+    eval_parser.add_argument(
+        "--policy",
+        dest="policy",
+        action="store_true",
+        help=(
+            "Run every eval case inside the sandbox declared in "
+            "[tool.vex.policy]. Requires sandbox = true; hard-fails with exit "
+            "code 2 when a sandbox backend is unavailable unless "
+            "unsafe_fallback = true."
+        ),
+    )
     eval_parser.add_argument("args", nargs=argparse.REMAINDER)
     eval_parser.set_defaults(handler=handle_eval)
 
@@ -3065,6 +3263,27 @@ def handle_eval(args: argparse.Namespace) -> int:
             )
             return 2
 
+    # --policy: optionally run every adapter under the declared sandbox.
+    policy_enabled = bool(getattr(args, "policy", False))
+    policy_dict: dict[str, Any] | None = None
+    unsafe_fallback_applied = False
+    if policy_enabled:
+        resolved_policy = load_vex_policy(root)
+        if not bool(resolved_policy.get("sandbox", True)):
+            print(
+                "vex eval --policy requires [tool.vex.policy].sandbox = true "
+                "(set sandbox = true in pyproject.toml or run "
+                "'vex policy set sandbox true --type bool')"
+            )
+            return 2
+        _prefix, fallback_applied, exit_code = resolve_eval_sandbox(
+            root, resolved_policy
+        )
+        if exit_code != 0:
+            return exit_code
+        policy_dict = {str(key): value for key, value in resolved_policy.items()}
+        unsafe_fallback_applied = fallback_applied
+
     # Adapter selection precedence:
     # 1. explicit --command -> always use harness (per-case or single)
     # 2. --no-promptfoo (deprecated) -> treat as --adapter harness, warn
@@ -3138,6 +3357,8 @@ def handle_eval(args: argparse.Namespace) -> int:
             timeout=max(1.0, float(args.timeout)),
             emit_json=bool(args.emit_json),
             min_pass_rate=min_pass_rate,
+            policy=policy_dict,
+            unsafe_fallback_applied=unsafe_fallback_applied,
         )
 
     if selected_adapter == "promptfoo" and promptfoo_path is not None:
@@ -3151,6 +3372,8 @@ def handle_eval(args: argparse.Namespace) -> int:
             timeout=max(1.0, float(args.timeout)),
             emit_json=bool(args.emit_json),
             min_pass_rate=min_pass_rate,
+            policy=policy_dict,
+            unsafe_fallback_applied=unsafe_fallback_applied,
         )
 
     command = args.command
@@ -3173,6 +3396,8 @@ def handle_eval(args: argparse.Namespace) -> int:
             out_path=out_path,
             emit_json=bool(args.emit_json),
             min_pass_rate=min_pass_rate,
+            policy=policy_dict,
+            unsafe_fallback_applied=unsafe_fallback_applied,
         )
     return run_eval_harness(
         root,
@@ -3181,6 +3406,8 @@ def handle_eval(args: argparse.Namespace) -> int:
         out_path=out_path,
         emit_json=bool(args.emit_json),
         min_pass_rate=min_pass_rate,
+        policy=policy_dict,
+        unsafe_fallback_applied=unsafe_fallback_applied,
     )
 
 

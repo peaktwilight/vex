@@ -124,6 +124,18 @@ sandbox_pids_limit = 64
 unsafe_fallback = false
 ```
 
+## Enforcement surfaces
+
+`[tool.vex.policy]` is enforced wherever vex launches a subprocess that runs
+project code:
+
+- `vex run --sandbox ...` — direct invocation under the container shape
+  described above.
+- `vex eval --policy` — wraps every adapter (`harness`, `per-case`,
+  `promptfoo`, `inspect`) under the same sandbox. See
+  [`docs/eval.md#--policy`](eval.md#--policy--run-evals-under-the-declared-sandbox)
+  for the argv shape, the report snapshot, and the hard-fail conditions.
+
 ## Relationship to `vex-ai-runtime`
 
 `vex run --sandbox` is container-level isolation. For the *native* execution

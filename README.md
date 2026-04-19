@@ -23,7 +23,7 @@ vex policy list                             # prints the effective contract
 
 `vex deploy` is the same contract, pointed at Modal / Cloud Run / Docker. `vex eval` is the same contract, pointed at a dataset. The policy that makes the agent safe in production is the policy your evals already ran under — one artifact, three execution surfaces.
 
-Near-future: `vex eval --policy` will run every eval case inside the sandbox defined by `[tool.vex.policy]`, and `vex deploy --policy-gate` will refuse to ship an agent whose declared tool surface exceeds its policy budget. Enforcement is shipped today via `vex run --sandbox`; the eval and deploy gates are on the roadmap below.
+`vex eval --policy` runs every eval case inside the sandbox defined by `[tool.vex.policy]`, so a case that would need network egress fails the same way the deployed agent would. Near-future: `vex deploy --policy-gate` will refuse to ship an agent whose declared tool surface exceeds its policy budget. Enforcement is shipped today via `vex run --sandbox` and `vex eval --policy`; the deploy gate is on the roadmap below.
 
 ## Not another `langgraph new`
 
@@ -93,7 +93,7 @@ Policy and sandbox (the contract):
 Eval / deploy / doctor / init:
 
 - `vex eval --command ...` and `vex eval --per-case --command "... {input} ..."` — dataset-driven checks
-- `vex eval` auto-delegates to [Inspect AI](https://inspect.aisi.org.uk/) (default) via `uvx --from inspect-ai inspect` when `inspect.yaml` / `inspect.toml` or `evals/*.inspect.py` is present, with [`promptfoo`](https://www.promptfoo.dev) (opt-in) as a fallback when `promptfooconfig.yaml` is present. Use `--adapter inspect|promptfoo|harness|auto` to override, `--json` for machine-readable output, and `--min-pass-rate 0.9` to gate CI on a fraction of passing cases. Override defaults in `[tool.vex.eval]` (`adapter = "auto"|"inspect"|"promptfoo"|"harness"`, `min_pass_rate = 0.9`). `--no-promptfoo` is kept as a deprecated alias for `--adapter harness`.
+- `vex eval` auto-delegates to [Inspect AI](https://inspect.aisi.org.uk/) (default) via `uvx --from inspect-ai inspect` when `inspect.yaml` / `inspect.toml` or `evals/*.inspect.py` is present, with [`promptfoo`](https://www.promptfoo.dev) (opt-in) as a fallback when `promptfooconfig.yaml` is present. Use `--adapter inspect|promptfoo|harness|auto` to override, `--json` for machine-readable output, `--min-pass-rate 0.9` to gate CI on a fraction of passing cases, and `--policy` to run every adapter inside the `[tool.vex.policy]` sandbox (stamps a `policy` block into the report). Override defaults in `[tool.vex.eval]` (`adapter = "auto"|"inspect"|"promptfoo"|"harness"`, `min_pass_rate = 0.9`). `--no-promptfoo` is kept as a deprecated alias for `--adapter harness`.
 - `vex deploy docker|cloud-run|modal [--apply|--run]` — scaffold + ship end-to-end; `docker --run` builds and runs locally, `cloud-run --apply` runs `gcloud builds submit` then `gcloud run deploy` and echoes the service URL, `modal --run` invokes `modal deploy` and surfaces the `*.modal.run` URL. Profile inheritance (`inherit = "default"`), env interpolation (`${VEX_IMAGE_REPO}`), and Cloud Run profile fields (`project`, `memory`, `cpu`, `min_instances`, `max_instances`, `service_account`, `allow_unauthenticated`). Preflight runs automatically on `--apply`/`--run` (override with `--skip-preflight`)
 - `vex deploy check [--for all|docker|cloud-run|modal]` — preflight
 - `vex doctor ai` — readiness report (uv, pyproject, policy, provider env, ollama reachability, eval dataset shape, deploy profile env vars)
@@ -128,7 +128,6 @@ No API key? `vex` falls back to a local [`ollama`](https://ollama.com) model —
 
 The policy contract turns into a gate, not just a declaration:
 
-- `vex eval --policy` — run every eval case inside the `[tool.vex.policy]` sandbox, so a case that needs network egress fails the same way the deployed agent would
 - `vex deploy --policy-gate` — refuse to ship an agent whose declared tool surface exceeds its policy budget, and re-express the policy as the target's native primitive (Modal sandbox, Cloud Run IAM, Docker cap-drop)
 - Trace tail in `vex dev` — inline LLM / tool-call trace view during the reload loop
 - Inspect AI adapter as the default eval backend (see [issue #23](https://github.com/peaktwilight/vex/issues/23))

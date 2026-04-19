@@ -112,6 +112,49 @@ existing `--json` and `--min-pass-rate` flags:
 vex eval --json --min-pass-rate 0.9 > results.json
 ```
 
+## `--policy` — run evals under the declared sandbox
+
+`vex eval --policy` wraps every adapter (`harness`, `per-case`, `promptfoo`,
+`inspect`) inside the sandbox declared in [`[tool.vex.policy]`](policy.md).
+Uses the same argv shape as `vex run --sandbox`: `--cap-drop ALL`,
+`--read-only`, `--network <none|bridge>`, memory + pids caps, project mounted
+read-only at `/workspace`. Adds a `policy` block to the normalized report
+(schema stays `vex-eval/v1`, additive only):
+
+```json
+{
+  "policy": {
+    "enforced": true,
+    "network": "deny",
+    "filesystem": "project",
+    "sandbox_backend": "docker",
+    "sandbox_image": "python:3.12-slim",
+    "sandbox_memory_mb": 1024,
+    "sandbox_pids_limit": 128,
+    "unsafe_fallback_applied": false
+  }
+}
+```
+
+Hard-fail conditions:
+
+- `[tool.vex.policy].sandbox = false` combined with `--policy` exits `2` with
+  a message pointing at `vex policy set sandbox true --type bool`.
+- No sandbox backend available (no `podman` or `docker` on `PATH`) and
+  `unsafe_fallback = false` exits `2` with a pointer at `vex doctor ai`.
+- `unsafe_fallback = true` + no backend runs the adapter locally, prints a
+  `WARN sandbox backend unavailable; running eval without sandbox enforcement
+  (unsafe_fallback=true)` banner, and stamps `enforced: false,
+  unsafe_fallback_applied: true` in the report.
+
+`promptfoo` and `inspect` adapters shell out via `uvx`; when `--policy` is
+active, the entire `uvx promptfoo ...` / `uvx --from inspect-ai inspect ...`
+invocation runs inside the container. The default `python:3.12-slim` image
+does not bundle `uv`, so the adapter prepends a one-shot
+`command -v uvx >/dev/null 2>&1 || pip install --quiet uv` shim before the
+`uvx` call. A follow-up `vex/sandbox-eval:latest` image will pre-bake `uv`
+and drop the shim (see issue #33 discussion).
+
 See also: [`architecture.md`](architecture.md),
 [`product-boundary.md`](product-boundary.md), [`deploy.md`](deploy.md),
 [`policy.md`](policy.md).
