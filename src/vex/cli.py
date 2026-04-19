@@ -460,6 +460,7 @@ def doctor_checks(root: Path, scope: str | None = None) -> tuple[int, list[str]]
             lines.append("WARN missing deploy.targets.toml default profile")
 
         runtime_root = resolve_runtime_root(root)
+        runtime_override = os.environ.get("VEX_AI_RUNTIME_PATH")
         if runtime_root is not None:
             lines.append(f"OK  runtime path resolved to {runtime_root}")
             schema_path = runtime_root / "schemas" / "vex-model-schema.json"
@@ -468,9 +469,15 @@ def doctor_checks(root: Path, scope: str | None = None) -> tuple[int, list[str]]
             else:
                 issues += 1
                 lines.append("WARN runtime schema file missing")
-        else:
+        elif runtime_override:
             issues += 1
-            lines.append("WARN runtime path not resolved (set VEX_AI_RUNTIME_PATH if needed)")
+            lines.append(
+                f"WARN VEX_AI_RUNTIME_PATH={runtime_override} does not exist"
+            )
+        else:
+            lines.append(
+                "INFO runtime path not resolved; set VEX_AI_RUNTIME_PATH if you vendored the runtime"
+            )
 
         if bool(policy.get("sandbox", True)):
             backend = sandbox_backend(policy)
