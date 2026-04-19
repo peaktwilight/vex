@@ -649,6 +649,82 @@ class CliTests(unittest.TestCase):
             output,
         )
 
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-testkey"}, clear=False)
+    @patch("vex.cli.sandbox_image_cached", return_value=True)
+    @patch("vex.cli.sandbox_backend", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_runtime_missing_is_soft_for_scaffolded_project(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        os.environ.pop("VEX_AI_RUNTIME_PATH", None)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.env]\npath = \".venv\"\n\n"
+                "[tool.vex.scripts]\n"
+                'dev = "python -m demo.main"\n'
+                'benchmark = "python -m demo.benchmark"\n'
+                'eval = "python evals/run_eval.py --input {input}"\n\n'
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n',
+                encoding="utf-8",
+            )
+            (root / "deploy.targets.toml").write_text(
+                "[profiles.default]\n"
+                'image = "ghcr.io/example/demo"\n',
+                encoding="utf-8",
+            )
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            (root / ".venv").mkdir()
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        self.assertIn("INFO runtime path not resolved", output)
+        self.assertNotIn("WARN runtime path", output)
+
+    @patch.dict(os.environ, {"VEX_AI_RUNTIME_PATH": "/definitely/not/a/real/path"}, clear=False)
+    @patch("vex.cli.sandbox_image_cached", return_value=True)
+    @patch("vex.cli.sandbox_backend", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_runtime_missing_errors_when_env_var_set(
+        self,
+        _uv_bin: object,
+        _sandbox_backend: object,
+        _image_cached: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = true\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertNotEqual(code, 0)
+        self.assertIn(
+            "WARN VEX_AI_RUNTIME_PATH=/definitely/not/a/real/path does not exist",
+            output,
+        )
+
     @patch.dict(os.environ, {}, clear=True)
     @patch("vex.cli.shutil.which", return_value=None)
     @patch("vex.cli.sandbox_image_cached", return_value=None)
