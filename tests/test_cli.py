@@ -2476,6 +2476,304 @@ class CliTests(unittest.TestCase):
             ["docker", "run", "--rm", "-p", "8080:8080", "ghcr.io/acme/app:v1"],
         )
 
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_deploy_docker_policy_gate_adds_caps_and_net(
+        self, run_command: object, _docker: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n'
+                "sandbox_memory_mb = 512\n"
+                "sandbox_pids_limit = 64\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "deploy",
+                        "docker",
+                        "--image",
+                        "ghcr.io/acme/app",
+                        "--tag",
+                        "v1",
+                        "--run",
+                        "--port",
+                        "8080",
+                        "--policy-gate",
+                        "--skip-preflight",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        run_argv = run_command.call_args_list[-1].args[0]
+        # docker run argv should contain the hardened flags.
+        self.assertEqual(run_argv[0:2], ["docker", "run"])
+        self.assertIn("--cap-drop", run_argv)
+        self.assertIn("ALL", run_argv)
+        self.assertIn("--read-only", run_argv)
+        self.assertIn("--network", run_argv)
+        self.assertIn("none", run_argv)
+        self.assertIn("--memory", run_argv)
+        self.assertIn("512m", run_argv)
+        self.assertIn("--pids-limit", run_argv)
+        self.assertIn("64", run_argv)
+        self.assertIn("--security-opt", run_argv)
+        self.assertIn("no-new-privileges", run_argv)
+        # Port mapping + image must survive.
+        self.assertIn("8080:8080", run_argv)
+        self.assertEqual(run_argv[-1], "ghcr.io/acme/app:v1")
+        # Summary line should print on success.
+        self.assertIn("[policy-gate]", output)
+        self.assertIn("enforced via docker", output)
+
+    @patch("vex.cli.run_command_capture", return_value=(0, "https://svc.a.run.app\n", ""))
+    @patch("vex.cli.run_command", return_value=0)
+    @patch("vex.cli.shutil.which", return_value="/usr/bin/gcloud")
+    def test_deploy_cloud_run_policy_gate_rejects_allow_unauth(
+        self,
+        _which: object,
+        _run_command: object,
+        _run_capture: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n',
+                encoding="utf-8",
+            )
+            (root / "deploy.targets.toml").write_text(
+                "[profiles.default]\n"
+                'image = "gcr.io/demo/app"\n'
+                'tag = "v1"\n'
+                'service = "svc"\n'
+                'region = "us-west1"\n'
+                "allow_unauthenticated = true\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                buffer = io.StringIO()
+                err_buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(err_buffer):
+                    from vex.cli import main as cli_main
+                    code = cli_main(
+                        [
+                            "deploy",
+                            "cloud-run",
+                            "--apply",
+                            "--project",
+                            "p",
+                            "--policy-gate",
+                            "--skip-preflight",
+                        ]
+                    )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 2)
+        self.assertIn("allow_unauthenticated", err_buffer.getvalue())
+
+    @patch("vex.cli.run_command_capture", return_value=(0, "https://svc.a.run.app\n", ""))
+    @patch("vex.cli.run_command", return_value=0)
+    @patch("vex.cli.shutil.which", return_value="/usr/bin/gcloud")
+    def test_deploy_cloud_run_policy_gate_injects_no_unauth_flag(
+        self,
+        _which: object,
+        _run_command: object,
+        run_capture: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n',
+                encoding="utf-8",
+            )
+            (root / "deploy.targets.toml").write_text(
+                "[profiles.default]\n"
+                'image = "gcr.io/demo/app"\n'
+                'tag = "v1"\n'
+                'service = "svc"\n'
+                'region = "us-west1"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "deploy",
+                        "cloud-run",
+                        "--apply",
+                        "--project",
+                        "p",
+                        "--policy-gate",
+                        "--skip-preflight",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        deploy_argv = run_capture.call_args.args[0]
+        self.assertEqual(deploy_argv[0:4], ["gcloud", "run", "deploy", "svc"])
+        self.assertIn("--no-allow-unauthenticated", deploy_argv)
+        self.assertIn("--cpu-boost=false", deploy_argv)
+        self.assertIn("[policy-gate]", output)
+        self.assertIn("allow_unauth=false", output)
+        self.assertIn("enforced via cloud-run", output)
+
+    @patch(
+        "vex.cli.run_command_capture",
+        return_value=(0, "View app at https://acme--demo-app.modal.run\n", ""),
+    )
+    @patch("vex.cli.shutil.which")
+    def test_deploy_modal_policy_gate_prints_warning_not_fail_on_permissive(
+        self,
+        which_mock: object,
+        _run_capture: object,
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/bin/modal" if name == "modal" else None
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n',
+                encoding="utf-8",
+            )
+            # Pre-seed a permissive modal scaffold to override what scaffold_modal
+            # would normally write. scaffold_modal overwrites on each run, so
+            # instead we monkey-patch the scaffolded file AFTER scaffold runs by
+            # using a post-scaffold hook is impractical — instead we rely on
+            # scaffold_modal writing first, then we inject permissive markers by
+            # patching the file right before deploy. For simplicity in this
+            # test, we rewrite the file after scaffold_modal runs by watching
+            # the parent's working directory. Easiest approach: run in two
+            # steps — scaffold only (no --run), then rewrite, then --run.
+            os.chdir(temp_dir)
+            try:
+                # Step 1: scaffold only.
+                scaffold_code, _ = self.run_cli(
+                    ["deploy", "modal", "--app-name", "demo-app", "--skip-preflight"]
+                )
+                self.assertEqual(scaffold_code, 0)
+
+                # Step 2: rewrite scaffold with a permissive shape, then --run.
+                (Path(temp_dir) / "deploy" / "modal_app.py").write_text(
+                    "import modal\n"
+                    "app = modal.App(name=\"demo-app\")\n"
+                    "image = modal.Image.debian_slim()\n"
+                    "@app.function(image=image, allow_network=True)\n"
+                    "def healthz():\n"
+                    "    return {\"status\": \"ok\"}\n",
+                    encoding="utf-8",
+                )
+
+                # We need to NOT re-scaffold. scaffold_modal overwrites, so
+                # we patch it out for the second invocation.
+                with patch("vex.cli.scaffold_modal") as scaffold_mock:
+                    scaffold_mock.return_value = Path(temp_dir) / "deploy" / "modal_app.py"
+                    buffer = io.StringIO()
+                    err_buffer = io.StringIO()
+                    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(err_buffer):
+                        from vex.cli import main as cli_main
+                        code = cli_main(
+                            [
+                                "deploy",
+                                "modal",
+                                "--run",
+                                "--app-name",
+                                "demo-app",
+                                "--policy-gate",
+                                "--skip-preflight",
+                            ]
+                        )
+                    combined_output = buffer.getvalue() + err_buffer.getvalue()
+            finally:
+                os.chdir(original_cwd)
+
+        # Permissive scaffold prints a WARN but does not fail the deploy.
+        self.assertEqual(code, 0)
+        self.assertIn("WARN", combined_output)
+        self.assertIn("allow_network", combined_output)
+        self.assertIn("[policy-gate]", combined_output)
+        self.assertIn("enforced via modal", combined_output)
+
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_deploy_policy_gate_refuses_when_sandbox_disabled(
+        self, _run_command: object, _docker: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "pyproject.toml").write_text(
+                "[tool.vex.policy]\n"
+                "sandbox = false\n"
+                'network = "deny"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                buffer = io.StringIO()
+                err_buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(err_buffer):
+                    from vex.cli import main as cli_main
+                    code = cli_main(
+                        [
+                            "deploy",
+                            "docker",
+                            "--run",
+                            "--policy-gate",
+                            "--skip-preflight",
+                        ]
+                    )
+                err_out = err_buffer.getvalue()
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 2)
+        self.assertIn("sandbox = false", err_out)
+
+    @patch("vex.cli.docker_like_bin", return_value="docker")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_deploy_no_policy_gate_flag_preserves_old_behavior(
+        self, run_command: object, _docker: object
+    ) -> None:
+        code, _output = self.run_cli(
+            [
+                "deploy",
+                "docker",
+                "--image",
+                "ghcr.io/acme/app",
+                "--tag",
+                "v1",
+                "--run",
+                "--port",
+                "9000",
+                "--skip-preflight",
+            ]
+        )
+        self.assertEqual(code, 0)
+        run_argv = run_command.call_args_list[-1].args[0]
+        self.assertEqual(
+            run_argv,
+            ["docker", "run", "--rm", "-p", "9000:9000", "ghcr.io/acme/app:v1"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

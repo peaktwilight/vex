@@ -113,6 +113,46 @@ Order of resolution for every knob (highest wins):
 
 Select a non-default profile with `--profile <name>`.
 
+## Policy gating
+
+`vex deploy <target> --policy-gate` translates `[tool.vex.policy]` into each
+target's native primitive and hard-fails when the effective policy would ship
+something permissive. The flag is **opt-in** for this release
+(`--no-policy-gate` is the default). Pair with `--apply` / `--run` — scaffold-
+only invocations do not gate.
+
+### Hard-fail pre-checks (shared)
+
+Before any target-specific work runs, `--policy-gate` aborts with exit code 2
+when any of the following hold:
+
+- `policy.sandbox = false` — "refuse to deploy with sandbox = false"
+- `policy.network = "allow"` AND the active profile sets no explicit egress
+  rule (no `egress`, `vpc_egress`, `network`, or similar key) — "refuse to
+  deploy with permissive network policy"
+- `policy.unsafe_fallback = true` — "refuse to ship with unsafe_fallback
+  enabled"
+
+### Per-target translation
+
+| Target       | Translation when `--policy-gate` is set                                                                                                                                                         |
+|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `docker --run`  | Append `--cap-drop ALL`, `--read-only`, `--security-opt no-new-privileges`, `--memory <sandbox_memory_mb>m`, `--pids-limit <sandbox_pids_limit>` to the `docker run` argv, plus `--network none` when `policy.network = "deny"`. Port mapping from `--port` is preserved. |
+| `cloud-run --apply` | Refuse when the profile has `allow_unauthenticated = true`. Otherwise inject `--no-allow-unauthenticated` (unless the profile already sets it), plus `--no-cpu-throttling=false` and `--cpu-boost=false`. When `policy.network = "deny"` and the profile has a `vpc_connector`, also inject `--egress all`. If no VPC connector is present, print a `WARN` instead of failing. |
+| `modal --run`   | Best-effort heuristic on the scaffolded `deploy/modal_app.py`: warn if no Modal `Image` base (e.g. `Image.debian_slim`, `Image.from_registry`, `Image.from_dockerfile`) is present, and warn on permissive markers like `allow_network=True`. v1 never fails — deeper Modal sandbox translation is deferred to v2. |
+
+On success, a gated deploy prints a summary line:
+
+```
+[policy-gate] network=deny filesystem=project image=python:3.12-slim allow_unauth=false — enforced via <target>
+```
+
+### Escape hatch
+
+`--no-policy-gate` (or simply omitting `--policy-gate`) turns the translation
+off entirely. Once the default flips to `--policy-gate` in a follow-up, this
+flag will be the opt-out path.
+
 See also: [`architecture.md`](architecture.md),
 [`product-boundary.md`](product-boundary.md), [`policy.md`](policy.md),
 [`eval.md`](eval.md).

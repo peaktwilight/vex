@@ -2400,6 +2400,71 @@ def docker_like_bin() -> str | None:
     return shutil.which("docker") or shutil.which("podman")
 
 
+def _profile_has_explicit_egress(profile: dict[str, Any]) -> bool:
+    """Detect whether the active deploy profile pins an explicit egress rule.
+
+    Used by ``--policy-gate`` to decide whether a permissive
+    ``policy.network = "allow"`` is OK (because the profile pins egress
+    elsewhere) or is a red flag (because nothing downstream narrows it).
+    """
+    for key in ("egress", "vpc_egress", "vpc-egress", "egress_policy", "network"):
+        if key in profile:
+            return True
+    return False
+
+
+def policy_gate_preflight(
+    policy: dict[str, Any],
+    profile: dict[str, Any],
+) -> tuple[int, list[str]]:
+    """Hard-fail checks shared by every ``--policy-gate`` target.
+
+    Returns ``(exit_code, messages)``. ``exit_code == 0`` means the gate is
+    clear. Any non-zero code indicates the caller should emit the messages
+    and abort before any target-specific work runs.
+    """
+    messages: list[str] = []
+    if not bool(policy.get("sandbox", True)):
+        messages.append(
+            "policy-gate: refuse to deploy with sandbox = false. "
+            "Set [tool.vex.policy].sandbox = true or drop --policy-gate."
+        )
+        return 2, messages
+
+    network = str(policy.get("network", "deny"))
+    if network != "deny" and not _profile_has_explicit_egress(profile):
+        messages.append(
+            "policy-gate: refuse to deploy with permissive network policy "
+            f"(network = {network!r}) and no explicit egress rule on the profile. "
+            'Set [tool.vex.policy].network = "deny" or disable the gate.'
+        )
+        return 2, messages
+
+    if bool(policy.get("unsafe_fallback", False)):
+        messages.append(
+            "policy-gate: refuse to ship with unsafe_fallback = true. "
+            "Disable the fallback or drop --policy-gate."
+        )
+        return 2, messages
+
+    return 0, messages
+
+
+def policy_gate_summary(policy: dict[str, Any], target: str, *, allow_unauth: bool | None = None) -> str:
+    """Format the single-line summary echoed after a gated deploy succeeds."""
+    network = str(policy.get("network", "deny"))
+    filesystem = str(policy.get("filesystem", "project"))
+    image = str(policy.get("sandbox_image", "python:3.12-slim"))
+    parts = [
+        f"network={network}",
+        f"filesystem={filesystem}",
+        f"image={image}",
+    ]
+    if allow_unauth is not None:
+        parts.append(f"allow_unauth={'true' if allow_unauth else 'false'}")
+    return f"[policy-gate] {' '.join(parts)} — enforced via {target}"
+
+
 def deploy_docker(
     root: Path,
     image: str,
@@ -2407,6 +2472,8 @@ def deploy_docker(
     push: bool,
     run_container: bool = False,
     port: int | None = None,
+    policy_gate: bool = False,
+    policy: dict[str, Any] | None = None,
 ) -> int:
     tool = docker_like_bin()
     if tool is None:
@@ -2427,13 +2494,23 @@ def deploy_docker(
     if run_container:
         mapped_port = port if port is not None else 8000
         port_mapping = f"{mapped_port}:{mapped_port}"
-        run_code = run_command(
-            [tool, "run", "--rm", "-p", port_mapping, full_image],
-            cwd=root,
-        )
+        run_argv: list[str] = [tool, "run", "--rm", "-p", port_mapping]
+        if policy_gate and policy is not None:
+            run_argv.extend(["--cap-drop", "ALL", "--read-only"])
+            if str(policy.get("network", "deny")) == "deny":
+                run_argv.extend(["--network", "none"])
+            memory_mb = int(policy.get("sandbox_memory_mb", 1024))
+            run_argv.extend(["--memory", f"{memory_mb}m"])
+            pids_limit = int(policy.get("sandbox_pids_limit", 128))
+            run_argv.extend(["--pids-limit", str(pids_limit)])
+            run_argv.extend(["--security-opt", "no-new-privileges"])
+        run_argv.append(full_image)
+        run_code = run_command(run_argv, cwd=root)
         if run_code != 0:
             return run_code
         print(f"Ran image {full_image} on port {mapped_port}")
+        if policy_gate and policy is not None:
+            print(policy_gate_summary(policy, "docker"))
         return 0
 
     print(f"Built image {full_image}")
@@ -2486,10 +2563,65 @@ def parse_cloud_run_url(output: str) -> str | None:
     return None
 
 
-def deploy_modal(root: Path, scaffold_path: Path) -> int:
+def inspect_modal_scaffold(scaffold_path: Path) -> tuple[bool, list[str]]:
+    """v1 best-effort heuristic check of a scaffolded ``modal_app.py``.
+
+    Returns ``(looks_hardened, warnings)``. We deliberately do NOT parse the
+    AST — the point is to catch the two or three patterns most likely to
+    leak a permissive Modal app through ``--policy-gate``. A full translation
+    into Modal sandbox primitives is out of scope for v1.
+    """
+    warnings: list[str] = []
+    if not scaffold_path.exists():
+        warnings.append(f"policy-gate (modal): scaffold not found at {scaffold_path}")
+        return False, warnings
+    try:
+        source = scaffold_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        warnings.append(f"policy-gate (modal): unable to read {scaffold_path}: {exc}")
+        return False, warnings
+
+    # "Hardened" in v1 just means we see a Modal Image base — debian_slim /
+    # from_registry / from_dockerfile — so something is pinning the image.
+    hardened_patterns = ("Image.debian_slim", "Image.from_registry", "Image.from_dockerfile")
+    looks_hardened = any(pattern in source for pattern in hardened_patterns)
+    if not looks_hardened:
+        warnings.append(
+            "policy-gate (modal): no Modal Image base detected "
+            "(expected Image.debian_slim / Image.from_registry / Image.from_dockerfile)."
+        )
+
+    # Heuristic flags for the common "I punched a hole in the sandbox" patterns.
+    permissive_markers = (
+        "allow_network=True",
+        "allow_network = True",
+        '_allow_background_volume_commits=True',
+        'allow_concurrent_inputs',  # not strictly unsafe, but worth surfacing
+    )
+    hits = [marker for marker in permissive_markers if marker in source]
+    if hits:
+        warnings.append(
+            "policy-gate (modal): permissive markers found in scaffold: "
+            + ", ".join(sorted(set(hits)))
+            + ". Review before shipping; v1 does not fail on these."
+        )
+
+    return looks_hardened and not hits, warnings
+
+
+def deploy_modal(
+    root: Path,
+    scaffold_path: Path,
+    policy_gate: bool = False,
+    policy: dict[str, Any] | None = None,
+) -> int:
     if shutil.which("modal") is None:
         print("modal CLI not found", file=sys.stderr)
         return 127
+    if policy_gate:
+        _looks_hardened, warnings = inspect_modal_scaffold(scaffold_path)
+        for line in warnings:
+            print(f"WARN {line}", file=sys.stderr)
     code, stdout, stderr = run_command_capture(
         ["modal", "deploy", str(scaffold_path)],
         cwd=root,
@@ -2511,6 +2643,8 @@ def deploy_modal(root: Path, scaffold_path: Path) -> int:
         print(f"Deployed: {url}")
     else:
         print("Deployed (no URL detected in modal output)")
+    if policy_gate and policy is not None:
+        print(policy_gate_summary(policy, "modal"))
     return 0
 
 
@@ -2522,10 +2656,21 @@ def deploy_cloud_run(
     tag: str,
     project: str | None,
     profile: dict[str, Any],
+    policy_gate: bool = False,
+    policy: dict[str, Any] | None = None,
 ) -> int:
     if shutil.which("gcloud") is None:
         print("gcloud CLI not found", file=sys.stderr)
         return 127
+
+    allow_unauthenticated = profile_value(profile, "allow_unauthenticated", "allow-unauthenticated")
+    if policy_gate and allow_unauthenticated is True:
+        print(
+            "policy-gate: refuse to deploy to Cloud Run with "
+            "allow_unauthenticated = true. Flip the profile to false or drop --policy-gate.",
+            file=sys.stderr,
+        )
+        return 2
 
     full_image = f"{image}:{tag}"
 
@@ -2570,9 +2715,32 @@ def deploy_cloud_run(
     )
     if service_account:
         deploy_argv.extend(["--service-account", service_account])
-    allow_unauthenticated = profile_value(profile, "allow_unauthenticated", "allow-unauthenticated")
     if isinstance(allow_unauthenticated, bool):
         deploy_argv.append("--allow-unauthenticated" if allow_unauthenticated else "--no-allow-unauthenticated")
+
+    policy_gate_allow_unauth: bool | None = None
+    if policy_gate and policy is not None:
+        # Force --no-allow-unauthenticated unless the profile explicitly set it.
+        if not isinstance(allow_unauthenticated, bool):
+            deploy_argv.append("--no-allow-unauthenticated")
+        policy_gate_allow_unauth = bool(allow_unauthenticated) if isinstance(allow_unauthenticated, bool) else False
+
+        # Align runtime posture with a locked-down profile: no CPU boost, keep
+        # throttling on. "--no-cpu-throttling=false" is gcloud shorthand for
+        # "leave default throttling enabled."
+        deploy_argv.extend(["--no-cpu-throttling=false", "--cpu-boost=false"])
+
+        if str(policy.get("network", "deny")) == "deny":
+            vpc_connector = profile_value(profile, "vpc_connector", "vpc-connector")
+            if vpc_connector:
+                deploy_argv.extend(["--egress", "all"])
+            else:
+                print(
+                    "WARN policy-gate: policy.network = 'deny' but no VPC connector "
+                    "in profile; skipping --egress injection. "
+                    "Add vpc_connector = \"<name>\" to the profile to pin egress.",
+                    file=sys.stderr,
+                )
 
     code, stdout, stderr = run_command_capture(deploy_argv, cwd=root)
     if stdout:
@@ -2592,6 +2760,8 @@ def deploy_cloud_run(
         print(f"Deployed: {url}")
     else:
         print(f"Deployed service {service} (no URL detected in gcloud output)")
+    if policy_gate and policy is not None:
+        print(policy_gate_summary(policy, "cloud-run", allow_unauth=policy_gate_allow_unauth))
     return 0
 
 
@@ -2893,6 +3063,18 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_parser.add_argument("--profile", default="default")
     deploy_parser.add_argument("--skip-preflight", action="store_true")
     deploy_parser.add_argument("--for", dest="check_target", choices=["all", "docker", "cloud-run", "modal"], default="all")
+    deploy_parser.add_argument(
+        "--policy-gate",
+        dest="policy_gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Translate [tool.vex.policy] into target-native primitives "
+            "(cap-drop on docker, --no-allow-unauthenticated on cloud-run, "
+            "scaffold audit on modal) and hard-fail on permissive policy. "
+            "Opt-in for this release."
+        ),
+    )
     deploy_parser.set_defaults(handler=handle_deploy)
 
     policy_parser = subparsers.add_parser("policy", help=COMMAND_HELP["policy"])
@@ -3543,11 +3725,22 @@ def handle_deploy(args: argparse.Namespace) -> int:
     port_raw = _resolve_setting(args, profile, "port", None, "port")
     port = int(port_raw) if port_raw is not None else None
 
+    policy_gate = bool(getattr(args, "policy_gate", False))
+    policy = load_vex_policy(root) if policy_gate else None
+
     if args.target == "check":
         issues, lines = deploy_preflight(root, target=args.check_target, profile=profile)
         for line in lines:
             print(line)
         return 0 if issues == 0 else 1
+
+    # Common policy-gate preflight: must pass before any target-specific work.
+    if policy_gate and policy is not None and (args.apply or args.run):
+        gate_code, gate_messages = policy_gate_preflight(policy, profile)
+        for message in gate_messages:
+            print(message, file=sys.stderr)
+        if gate_code != 0:
+            return gate_code
 
     # Run preflight when we're about to actually hit external systems.
     if (args.apply or args.run) and not args.skip_preflight:
@@ -3571,6 +3764,8 @@ def handle_deploy(args: argparse.Namespace) -> int:
             push=push,
             run_container=bool(args.run),
             port=port,
+            policy_gate=policy_gate,
+            policy=policy,
         )
 
     if args.target == "cloud-run":
@@ -3585,6 +3780,8 @@ def handle_deploy(args: argparse.Namespace) -> int:
                 tag=tag,
                 project=project,
                 profile=profile,
+                policy_gate=policy_gate,
+                policy=policy,
             )
         return 0
 
@@ -3592,7 +3789,12 @@ def handle_deploy(args: argparse.Namespace) -> int:
         path = scaffold_modal(root, app_name=app_name)
         print(f"Wrote Modal scaffold to {path}")
         if args.run:
-            return deploy_modal(root, scaffold_path=path)
+            return deploy_modal(
+                root,
+                scaffold_path=path,
+                policy_gate=policy_gate,
+                policy=policy,
+            )
         return 0
 
     print("Unsupported deploy target")
