@@ -1830,6 +1830,290 @@ class CliTests(unittest.TestCase):
         # Human-friendly summary suppressed when --json is set.
         self.assertNotIn("Eval report written", output)
 
+    # ------------------------------------------------------------------
+    # vex eval --policy
+    # ------------------------------------------------------------------
+
+    @patch("vex.cli.sandbox_backend", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_eval_policy_wraps_harness_in_sandbox(
+        self,
+        run_command: object,
+        _uv_bin: object,
+        _backend: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n'
+                'filesystem = "project"\n'
+                'sandbox_backend = "docker"\n'
+                'sandbox_image = "python:3.12-slim"\n'
+                "sandbox_memory_mb = 1024\n"
+                "sandbox_pids_limit = 128\n"
+                "unsafe_fallback = false\n",
+                encoding="utf-8",
+            )
+            (root / "evals" / "datasets").mkdir(parents=True)
+            (root / "evals" / "datasets" / "cases.jsonl").write_text(
+                '{"input":"a"}\n', encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    [
+                        "eval",
+                        "--policy",
+                        "--command",
+                        "python -c 'print(1)'",
+                        "--out",
+                        "artifacts/evals/policy.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 0)
+        run_command.assert_called_once()
+        invoked_argv = run_command.call_args.args[0]
+        # The sandbox prefix must be the literal docker run --rm ... shape.
+        self.assertEqual(invoked_argv[0], "docker")
+        self.assertEqual(invoked_argv[1], "run")
+        self.assertEqual(invoked_argv[2], "--rm")
+        self.assertIn("--network", invoked_argv)
+        self.assertIn("--cap-drop", invoked_argv)
+        self.assertIn("ALL", invoked_argv)
+        self.assertIn("--read-only", invoked_argv)
+        # sh -c <command> must appear verbatim at the end.
+        self.assertEqual(invoked_argv[-3], "sh")
+        self.assertEqual(invoked_argv[-2], "-c")
+        self.assertEqual(invoked_argv[-1], "python -c 'print(1)'")
+
+    def test_eval_policy_fails_when_sandbox_disabled(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = false\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--policy",
+                        "--command",
+                        "python -c 'print(1)'",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(code, 2)
+        self.assertIn("requires [tool.vex.policy].sandbox = true", output)
+        self.assertIn("vex policy set sandbox true --type bool", output)
+
+    @patch("vex.cli.sandbox_backend", return_value="docker")
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_eval_policy_stamps_report_with_policy_snapshot(
+        self,
+        _run_command: object,
+        _uv_bin: object,
+        _backend: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n'
+                'filesystem = "project"\n'
+                'sandbox_backend = "docker"\n'
+                'sandbox_image = "python:3.12-slim"\n'
+                "sandbox_memory_mb = 1024\n"
+                "sandbox_pids_limit = 128\n"
+                "unsafe_fallback = false\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    [
+                        "eval",
+                        "--policy",
+                        "--command",
+                        "python -c 'print(1)'",
+                        "--out",
+                        "artifacts/evals/policy-stamp.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "policy-stamp.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(report["schema"], "vex-eval/v1")
+        self.assertIn("policy", report)
+        policy = report["policy"]
+        self.assertEqual(policy["enforced"], True)
+        self.assertEqual(policy["network"], "deny")
+        self.assertEqual(policy["filesystem"], "project")
+        self.assertEqual(policy["sandbox_backend"], "docker")
+        self.assertEqual(policy["sandbox_image"], "python:3.12-slim")
+        self.assertEqual(policy["sandbox_memory_mb"], 1024)
+        self.assertEqual(policy["sandbox_pids_limit"], 128)
+        self.assertEqual(policy["unsafe_fallback_applied"], False)
+
+    @patch("vex.cli.sandbox_backend", return_value="none")
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_eval_policy_honors_unsafe_fallback(
+        self,
+        run_command: object,
+        _uv_bin: object,
+        _backend: object,
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'sandbox_backend = "none"\n'
+                "unsafe_fallback = true\n",
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    [
+                        "eval",
+                        "--policy",
+                        "--command",
+                        "python -c 'print(1)'",
+                        "--out",
+                        "artifacts/evals/policy-fallback.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            report = json.loads(
+                (root / "artifacts" / "evals" / "policy-fallback.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn("unsafe_fallback=true", output)
+        # Ran locally (not wrapped): first two args are [uv, "run"].
+        invoked_argv = run_command.call_args.args[0]
+        self.assertEqual(invoked_argv[:2], ["uv", "run"])
+        # Report must mark enforcement off and fallback on.
+        self.assertEqual(report["policy"]["enforced"], False)
+        self.assertEqual(report["policy"]["unsafe_fallback_applied"], True)
+
+    @patch("vex.cli.sandbox_backend", return_value="docker")
+    @patch("vex.cli.shutil.which")
+    @patch("vex.cli.subprocess.run")
+    def test_eval_policy_wraps_promptfoo_uvx_invocation(
+        self,
+        subprocess_run: object,
+        which_mock: object,
+        _backend: object,
+    ) -> None:
+        which_mock.side_effect = lambda name: "/usr/local/bin/uvx" if name == "uvx" else None
+
+        class _Completed:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, **kwargs):  # type: ignore[no-untyped-def]
+            # The sandboxed invocation no longer writes a tmp output file on
+            # the host (it would run inside the container). Return empty
+            # results so the normalizer produces an empty report.
+            output_path_idx = None
+            if "--output" in argv:
+                output_path_idx = argv.index("--output") + 1
+            if output_path_idx is not None and output_path_idx < len(argv):
+                candidate = Path(argv[output_path_idx])
+                # Only write to host paths; skip container /workspace paths.
+                if candidate.is_absolute() and candidate.parent.exists():
+                    candidate.write_text(
+                        json.dumps({"results": {"results": []}}),
+                        encoding="utf-8",
+                    )
+            return _Completed()
+
+        subprocess_run.side_effect = _fake_run
+
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n'
+                'sandbox_backend = "docker"\n'
+                'sandbox_image = "python:3.12-slim"\n',
+                encoding="utf-8",
+            )
+            (root / "promptfooconfig.yaml").write_text(
+                "providers: []\n", encoding="utf-8"
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    [
+                        "eval",
+                        "--policy",
+                        "--adapter",
+                        "promptfoo",
+                        "--out",
+                        "artifacts/evals/policy-promptfoo.json",
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+        # No adapter content, exit code should be 0 (no failures detected) or
+        # 1 if the normalizer treats 0/0 as non-failing; the key assertion
+        # is the shape of the subprocess argv.
+        self.assertIn(code, (0, 1))
+        self.assertEqual(subprocess_run.call_count, 1)
+        invoked_argv = subprocess_run.call_args.args[0]
+        # Sandbox prefix.
+        self.assertEqual(invoked_argv[0], "docker")
+        self.assertEqual(invoked_argv[1], "run")
+        self.assertEqual(invoked_argv[2], "--rm")
+        self.assertIn("python:3.12-slim", invoked_argv)
+        # sh -c <shell_cmd> contains the uvx promptfoo invocation.
+        self.assertEqual(invoked_argv[-3], "sh")
+        self.assertEqual(invoked_argv[-2], "-c")
+        self.assertIn("uvx", invoked_argv[-1])
+        self.assertIn("promptfoo", invoked_argv[-1])
+        # Shim for uv-less default image.
+        self.assertIn("pip install", invoked_argv[-1])
+
     @patch("vex.cli.docker_like_bin", return_value="docker")
     @patch("vex.cli.run_command", return_value=0)
     def test_deploy_docker_builds_image(self, run_command: object, _docker: object) -> None:
