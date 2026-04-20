@@ -77,6 +77,15 @@ Flags:
 - `--provider-check` / `--no-provider-check` — toggle the
   `[vex dev] provider=...` banner. Default: on. The banner warns when
   `provider=ollama` but `ollama` is not on PATH.
+- `--trace` / `--no-trace` — toggle the dev trace. Default: on. When on,
+  `vex dev` exports `VEX_TRACE_DIR=<root>/artifacts/traces` to the child
+  environment so the scaffolded agent's `enable_dev_tracing()` hook writes
+  one OTel-GenAI-shaped JSONL line per LLM / tool call to
+  `artifacts/traces/dev-<YYYYMMDD-HHMMSS>.jsonl`. A sibling
+  `artifacts/traces/latest.jsonl` symlink points at the current session so
+  `tail -f artifacts/traces/latest.jsonl` Just Works. When stderr is a TTY
+  `vex dev` also tails that file inline with a dim `[trace]` prefix. See
+  [`tracing.md`](tracing.md) for the schema and viewer tips.
 - trailing args — forwarded verbatim to the dev command.
 
 Exit codes:

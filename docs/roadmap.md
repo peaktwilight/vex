@@ -26,8 +26,10 @@ AI-native workflow (the actual product):
   (openai / anthropic / ollama auto-resolution), `eval.py`, seed dataset,
   `.env.example`, `deploy.targets.toml` with `default` and `prod` profiles
 - `vex init inference-api` — FastAPI + uvicorn scaffold with typed schemas
-- `vex dev` — watchfiles-based hot reload plus a provider banner that reports
-  which model backend (hosted or ollama fallback) will be used
+- `vex dev` — watchfiles-based hot reload, a provider banner that reports
+  which model backend (hosted or ollama fallback) will be used, and an
+  inline `[trace]` tail of an OTel-GenAI-shaped JSONL per dev session
+  (`artifacts/traces/latest.jsonl`; opt out with `--no-trace`)
 - `vex benchmark` — warmup-aware harness with JSON output
 - `vex eval` — dataset-driven checks with `--json`, `--min-pass-rate`, and a
   promptfoo adapter that auto-delegates when `promptfooconfig.yaml` is present
@@ -57,8 +59,6 @@ On the path to v1:
   a CI gate so evals fail closed on policy violations, not just quality regressions
 - `vex deploy --policy-gate` — block `--apply`/`--run` when policy preconditions
   (sandbox, secrets, model signature) are not met
-- Trace tail in `vex dev` — inline spans from the agent / HTTP loop during
-  hot-reload so developers see what the model actually did
 - Inspect AI adapter for `vex eval` — in flight in
   [issue #23](https://github.com/peaktwilight/vex/issues/23); becomes the new
   default once it lands

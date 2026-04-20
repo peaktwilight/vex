@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -3443,6 +3444,198 @@ class VexExportImportTests(unittest.TestCase):
             manifest = build_vex_artifact_manifest(root, policy, files, [])
         self.assertIn("uv.lock", manifest["locks"])
         self.assertTrue(manifest["locks"]["uv.lock"].startswith("sha256:"))
+
+
+class DevTraceTests(unittest.TestCase):
+    """Coverage for vex dev --trace (closes #43)."""
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(argv)
+        return code, buffer.getvalue()
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_dev_sets_vex_trace_dir_env_by_default(
+        self, _run_command: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.scripts]\n"
+                'dev = "python -m http.server"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _out = self.run_cli(["dev", "--no-reload"])
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(code, 0)
+            actual_value = os.environ.get("VEX_TRACE_DIR")
+            self.assertIsNotNone(actual_value)
+            assert actual_value is not None
+            expected = (Path(temp_dir) / "artifacts" / "traces").resolve()
+            self.assertEqual(Path(actual_value).resolve(), expected)
+            self.assertTrue((Path(temp_dir) / "artifacts" / "traces").is_dir())
+
+    @patch.dict(os.environ, {}, clear=True)
+    @patch("vex.cli.uv_bin", return_value="uv")
+    @patch("vex.cli.run_command", return_value=0)
+    def test_dev_no_trace_flag_disables_env(
+        self, _run_command: object, _uv_bin: object
+    ) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pyproject = Path(temp_dir) / "pyproject.toml"
+            pyproject.write_text(
+                "[tool.vex.scripts]\n"
+                'dev = "python -m http.server"\n',
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _out = self.run_cli(["dev", "--no-reload", "--no-trace"])
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(code, 0)
+            self.assertNotIn("VEX_TRACE_DIR", os.environ)
+            self.assertFalse((Path(temp_dir) / "artifacts" / "traces").exists())
+
+    def test_trace_module_writes_jsonl_per_llm_call(self) -> None:
+        from vex import trace as trace_mod
+
+        trace_mod._reset_for_tests()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = trace_mod.enable_dev_tracing(temp_dir)
+            self.assertIsNotNone(path)
+            try:
+                logger = logging.getLogger("pydantic_ai")
+                record = logger.makeRecord(
+                    "pydantic_ai",
+                    logging.INFO,
+                    "test",
+                    0,
+                    "llm request complete",
+                    (),
+                    None,
+                    extra={
+                        "event": "llm_request",
+                        "latency_ms": 42.0,
+                        "gen_ai.system": "openai",
+                        "gen_ai.request.model": "gpt-4o-mini",
+                        "gen_ai.response.model": "gpt-4o-mini-2024-07-18",
+                        "gen_ai.usage.input_tokens": 7,
+                        "gen_ai.usage.output_tokens": 3,
+                    },
+                )
+                # Fire through our handler directly so we don't depend on
+                # global logger propagation being enabled.
+                handler = trace_mod._PYDANTIC_AI_HANDLER
+                self.assertIsNotNone(handler)
+                handler.handle(record)  # type: ignore[union-attr]
+
+                assert path is not None
+                lines = [
+                    line for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len(lines), 1)
+                payload = json.loads(lines[0])
+                self.assertEqual(payload["kind"], "llm_call")
+                self.assertIn("ts", payload)
+                self.assertIn("session_id", payload)
+                self.assertEqual(payload["latency_ms"], 42.0)
+            finally:
+                trace_mod._reset_for_tests()
+
+    def test_trace_otel_envelope_fields_present(self) -> None:
+        from vex import trace as trace_mod
+
+        trace_mod._reset_for_tests()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = trace_mod.enable_dev_tracing(temp_dir)
+            self.assertIsNotNone(path)
+            try:
+                trace_mod.record_llm_call(
+                    latency_ms=128.5,
+                    **{
+                        "gen_ai.system": "anthropic",
+                        "gen_ai.request.model": "claude-3-5-sonnet-latest",
+                        "gen_ai.response.model": "claude-3-5-sonnet-20241022",
+                        "gen_ai.usage.input_tokens": 12,
+                        "gen_ai.usage.output_tokens": 9,
+                    },
+                )
+                assert path is not None
+                lines = [
+                    line for line in path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(len(lines), 1)
+                payload = json.loads(lines[0])
+                for key in trace_mod.OTEL_GEN_AI_KEYS:
+                    self.assertIn(key, payload, msg=f"missing otel key: {key}")
+                self.assertEqual(payload["gen_ai.system"], "anthropic")
+                self.assertEqual(payload["gen_ai.usage.input_tokens"], 12)
+                self.assertEqual(payload["latency_ms"], 128.5)
+                self.assertEqual(payload["kind"], "llm_call")
+            finally:
+                trace_mod._reset_for_tests()
+
+    def test_trace_module_updates_latest_symlink(self) -> None:
+        from vex import trace as trace_mod
+
+        trace_mod._reset_for_tests()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first = trace_mod.enable_dev_tracing(temp_dir)
+            trace_mod._reset_for_tests()
+            # Second session: must rotate `latest.jsonl` to the new file.
+            # Sleep briefly so the timestamp in the filename differs.
+            import time as _time
+            _time.sleep(1.1)
+            second = trace_mod.enable_dev_tracing(temp_dir)
+            try:
+                self.assertIsNotNone(first)
+                self.assertIsNotNone(second)
+                assert first is not None and second is not None
+                self.assertNotEqual(first, second)
+                latest = Path(temp_dir) / "latest.jsonl"
+                self.assertTrue(latest.exists() or latest.is_symlink())
+                # Resolve (follow symlink if any) and compare to second file.
+                resolved = latest.resolve()
+                self.assertEqual(resolved, second.resolve())
+            finally:
+                trace_mod._reset_for_tests()
+
+    def test_scaffold_main_py_includes_trace_hook(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(["init", "agent", "support-agent"])
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertEqual(code, 0)
+            root = Path(temp_dir) / "support-agent"
+            main_src = (root / "src" / "support_agent" / "main.py").read_text(
+                encoding="utf-8"
+            )
+
+            self.assertIn('if os.environ.get("VEX_TRACE_DIR"):', main_src)
+            self.assertIn("from vex.trace import enable_dev_tracing", main_src)
+            self.assertIn("enable_dev_tracing(os.environ[\"VEX_TRACE_DIR\"])", main_src)
+            self.assertIn("except ImportError:", main_src)
+
+            gitignore = root / ".gitignore"
+            self.assertTrue(gitignore.exists())
+            self.assertIn("artifacts/traces/", gitignore.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

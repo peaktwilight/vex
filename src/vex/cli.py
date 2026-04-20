@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -959,6 +960,23 @@ def write_file(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def ensure_gitignore_entry(root: Path, entry: str) -> None:
+    """Append `entry` to `.gitignore` unless it's already there.
+
+    Creates `.gitignore` if it doesn't exist. Safe to call repeatedly.
+    """
+    path = root / ".gitignore"
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        lines = {line.strip() for line in existing.splitlines()}
+        if entry in lines or entry.rstrip("/") in lines:
+            return
+        suffix = "" if existing.endswith("\n") or not existing else "\n"
+        path.write_text(f"{existing}{suffix}{entry}\n", encoding="utf-8")
+        return
+    path.write_text(f"{entry}\n", encoding="utf-8")
+
+
 def scaffold_agent_template(root: Path, package_name: str) -> None:
     write_file(
         root / "src" / package_name / "__init__.py",
@@ -1050,6 +1068,12 @@ def scaffold_agent_template(root: Path, package_name: str) -> None:
             "        import logfire\n\n"
             "        logfire.configure()\n"
             "        logfire.instrument_pydantic_ai()\n"
+            "    except ImportError:\n"
+            "        pass\n\n"
+            "if os.environ.get(\"VEX_TRACE_DIR\"):\n"
+            "    try:\n"
+            "        from vex.trace import enable_dev_tracing\n\n"
+            "        enable_dev_tracing(os.environ[\"VEX_TRACE_DIR\"])\n"
             "    except ImportError:\n"
             "        pass\n\n"
             "from .agent import build_agent\n"
@@ -1203,6 +1227,7 @@ def scaffold_agent_template(root: Path, package_name: str) -> None:
             "    assert True\n"
         ),
     )
+    ensure_gitignore_entry(root, "artifacts/traces/")
 
 
 def _scaffold_agent_shared_files(root: Path, system_prompt: str) -> None:
@@ -4049,6 +4074,13 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    dev_parser.add_argument(
+        "--trace",
+        dest="trace",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write an OTel-GenAI-shaped JSONL trace to artifacts/traces/ and tail it",
+    )
     dev_parser.add_argument("args", nargs=argparse.REMAINDER)
     dev_parser.set_defaults(handler=handle_dev)
 
@@ -4441,72 +4473,147 @@ def _try_import_watchfiles() -> Any:
     return watchfiles
 
 
+def _start_trace_tail_thread(trace_dir: Path) -> threading.Event:
+    """Spawn a daemon thread that tails `<trace_dir>/latest.jsonl` to stderr.
+
+    Each new line is printed with an ANSI-dim `[trace]` prefix. Returns a stop
+    Event so callers can signal shutdown. The thread is a daemon, so it also
+    dies with the process.
+
+    Only runs when stderr is a TTY — no escape-code noise in logs.
+    """
+    stop = threading.Event()
+    if not sys.stderr.isatty():
+        stop.set()
+        return stop
+
+    latest = trace_dir / "latest.jsonl"
+
+    def _tail() -> None:
+        # Wait for the first session to create `latest.jsonl`.
+        deadline = time.monotonic() + 30
+        while not latest.exists() and not stop.is_set():
+            if time.monotonic() > deadline:
+                return
+            time.sleep(0.25)
+        if stop.is_set():
+            return
+        try:
+            target = latest.resolve()
+            last_size = 0
+            current_inode = target.stat().st_ino if target.exists() else None
+            while not stop.is_set():
+                try:
+                    resolved = latest.resolve()
+                    stat = resolved.stat()
+                    # Session rotated: new symlink target.
+                    if current_inode is not None and stat.st_ino != current_inode:
+                        target = resolved
+                        current_inode = stat.st_ino
+                        last_size = 0
+                    if stat.st_size > last_size:
+                        with resolved.open("r", encoding="utf-8", errors="replace") as fh:
+                            fh.seek(last_size)
+                            for line in fh:
+                                line = line.rstrip("\n")
+                                if not line:
+                                    continue
+                                sys.stderr.write(f"\x1b[2m[trace]\x1b[0m {line}\n")
+                            sys.stderr.flush()
+                        last_size = stat.st_size
+                    elif stat.st_size < last_size:
+                        # File truncated or replaced.
+                        last_size = stat.st_size
+                except (FileNotFoundError, OSError):
+                    pass
+                stop.wait(0.25)
+        except Exception:
+            # Never let the tail thread take down the dev loop.
+            return
+
+    thread = threading.Thread(target=_tail, name="vex-trace-tail", daemon=True)
+    thread.start()
+    return stop
+
+
 def run_dev_with_reload(
     uv_args: list[str],
     watch_paths: Sequence[Path],
     watchfiles_module: Any = None,
+    trace_dir: Path | None = None,
 ) -> int:
     """Start the dev command and restart it whenever a watched path changes.
 
     Graceful shutdown: SIGTERM, wait up to 3s, then SIGKILL.
     """
-    if watchfiles_module is None:
-        watchfiles_module = _try_import_watchfiles()
-    if watchfiles_module is None:
-        print(
-            "[vex dev] 'watchfiles' is not installed — running without reload "
-            "(install with: uv add watchfiles)"
-        )
-        return run_uv(uv_args)
-
-    uv = uv_bin()
-    if uv is None:
-        print("vex requires 'uv' on PATH", file=sys.stderr)
-        return 127
-
-    if not watch_paths:
-        print("[vex dev] no watch paths found — running without reload")
-        return run_uv(uv_args)
-
-    argv = [uv, *uv_args]
-    str_paths = [str(p) for p in watch_paths]
-    print(f"[vex dev] watching {len(str_paths)} path(s) for changes")
-
-    def _spawn() -> subprocess.Popen[bytes]:
-        return subprocess.Popen(argv)
-
-    def _shutdown(proc: subprocess.Popen[bytes]) -> None:
-        if proc.poll() is not None:
-            return
+    tail_stop: threading.Event | None = None
+    if trace_dir is not None:
         try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+            tail_stop = _start_trace_tail_thread(trace_dir)
+        except Exception:
+            tail_stop = None
 
-    proc = _spawn()
     try:
-        for _changes in watchfiles_module.watch(*str_paths):
-            print("[vex dev] change detected — restarting")
-            _shutdown(proc)
-            proc = _spawn()
-    except KeyboardInterrupt:
-        _shutdown(proc)
-        return 130
-    finally:
-        _shutdown(proc)
+        if watchfiles_module is None:
+            watchfiles_module = _try_import_watchfiles()
+        if watchfiles_module is None:
+            print(
+                "[vex dev] 'watchfiles' is not installed — running without reload "
+                "(install with: uv add watchfiles)"
+            )
+            return run_uv(uv_args)
 
-    return proc.returncode if proc.returncode is not None else 0
+        uv = uv_bin()
+        if uv is None:
+            print("vex requires 'uv' on PATH", file=sys.stderr)
+            return 127
+
+        if not watch_paths:
+            print("[vex dev] no watch paths found — running without reload")
+            return run_uv(uv_args)
+
+        argv = [uv, *uv_args]
+        str_paths = [str(p) for p in watch_paths]
+        print(f"[vex dev] watching {len(str_paths)} path(s) for changes")
+
+        def _spawn() -> subprocess.Popen[bytes]:
+            return subprocess.Popen(argv)
+
+        def _shutdown(proc: subprocess.Popen[bytes]) -> None:
+            if proc.poll() is not None:
+                return
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        proc = _spawn()
+        try:
+            for _changes in watchfiles_module.watch(*str_paths):
+                print("[vex dev] change detected — restarting")
+                _shutdown(proc)
+                proc = _spawn()
+        except KeyboardInterrupt:
+            _shutdown(proc)
+            return 130
+        finally:
+            _shutdown(proc)
+
+        return proc.returncode if proc.returncode is not None else 0
+    finally:
+        if tail_stop is not None:
+            tail_stop.set()
 
 
 def handle_dev(args: argparse.Namespace) -> int:
@@ -4521,12 +4628,26 @@ def handle_dev(args: argparse.Namespace) -> int:
         print("vex dev requires [tool.vex.scripts].dev in pyproject.toml")
         return 2
 
+    trace_enabled = bool(getattr(args, "trace", True))
+    trace_dir: Path | None = None
+    if trace_enabled:
+        trace_dir = root / "artifacts" / "traces"
+        try:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            os.environ["VEX_TRACE_DIR"] = str(trace_dir)
+            print(f"[vex dev] trace dir={trace_dir} (tail with: tail -f {trace_dir / 'latest.jsonl'})")
+        except OSError:
+            trace_dir = None
+            os.environ.pop("VEX_TRACE_DIR", None)
+    else:
+        os.environ.pop("VEX_TRACE_DIR", None)
+
     if getattr(args, "no_reload", False):
         return run_uv(uv_args)
 
     extra_watch = list(getattr(args, "watch", []) or [])
     watch_paths = resolve_dev_watch_paths(extra_watch, root)
-    return run_dev_with_reload(uv_args, watch_paths)
+    return run_dev_with_reload(uv_args, watch_paths, trace_dir=trace_dir)
 
 
 def handle_benchmark(args: argparse.Namespace) -> int:
@@ -5048,6 +5169,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--no-reload",
                 "--provider-check",
                 "--no-provider-check",
+                "--trace",
+                "--no-trace",
             }
             while index < len(raw_argv):
                 token = raw_argv[index]
