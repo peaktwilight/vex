@@ -147,4 +147,6 @@ policies on the inference path — see
 `vex-model/v1` manifest contract.
 
 See also: [`architecture.md`](architecture.md),
-[`product-boundary.md`](product-boundary.md), [`deploy.md`](deploy.md).
+[`product-boundary.md`](product-boundary.md), [`deploy.md`](deploy.md),
+[`artifacts.md`](artifacts.md) (the policy snapshot travels inside every
+`.vex` export).

@@ -2851,5 +2851,399 @@ class CliTests(unittest.TestCase):
         )
 
 
+class VexExportImportTests(unittest.TestCase):
+    """Tests for `vex export` and `vex import` — portable .vex artifacts (#42)."""
+
+    def run_cli(self, argv: list[str]) -> tuple[int, str]:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(argv)
+        return code, buffer.getvalue()
+
+    def _write_project(self, root: Path, name: str = "demo-bot", version: str = "0.1.0") -> None:
+        pyproject = (
+            "[project]\n"
+            f'name = "{name}"\n'
+            f'version = "{version}"\n'
+            'requires-python = ">=3.11"\n'
+            "\n"
+            "[tool.vex]\n"
+            "managed = true\n"
+            "\n"
+            "[tool.vex.policy]\n"
+            "sandbox = true\n"
+            'network = "deny"\n'
+            "\n"
+            "[tool.vex.ai]\n"
+            'template = "agent"\n'
+            'runtime = "vex-ai-runtime"\n'
+            'framework = "pydantic-ai"\n'
+            "\n"
+            "[tool.vex.eval]\n"
+            'adapter = "inspect"\n'
+        )
+        (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+        pkg_dir = root / "src" / name.replace("-", "_")
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        (pkg_dir / "__init__.py").write_text("\n", encoding="utf-8")
+        (pkg_dir / "main.py").write_text("def main():\n    print('hi')\n", encoding="utf-8")
+        (root / ".env.example").write_text("OPENAI_API_KEY=\n", encoding="utf-8")
+        (root / ".gitignore").write_text(".venv/\n__pycache__/\n", encoding="utf-8")
+        # Add noise that default excludes should strip.
+        venv = root / ".venv" / "bin"
+        venv.mkdir(parents=True, exist_ok=True)
+        (venv / "python").write_text("junk\n", encoding="utf-8")
+        cache = pkg_dir / "__pycache__"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "main.cpython-312.pyc").write_text("pyc\n", encoding="utf-8")
+        # Real secret that must never be exported.
+        (root / ".env").write_text("SECRET=42\n", encoding="utf-8")
+
+    def _extract_tar_members(self, artifact: Path) -> list[str]:
+        import tarfile as _tarfile
+        with _tarfile.open(artifact, mode="r:gz") as tf:
+            return sorted(m.name for m in tf.getmembers())
+
+    def test_export_writes_deterministic_tarball(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            os.chdir(temp_dir)
+            try:
+                code1, _ = self.run_cli(["export", "--out", "dist/a.vex"])
+                code2, _ = self.run_cli(["export", "--out", "dist/b.vex"])
+                a = (root / "dist" / "a.vex").read_bytes()
+                b = (root / "dist" / "b.vex").read_bytes()
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(code1, 0)
+        self.assertEqual(code2, 0)
+        self.assertEqual(a, b, "two exports of the same tree must be byte-identical")
+
+    def test_export_manifest_has_required_fields(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root, name="support-bot", version="0.3.2")
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["export", "--dry-run"])
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(code, 0)
+        manifest = json.loads(output)
+        for key in (
+            "schema",
+            "name",
+            "version",
+            "created_at",
+            "python_requires",
+            "entry_module",
+            "policy",
+            "adapters",
+            "files",
+            "models",
+            "locks",
+        ):
+            self.assertIn(key, manifest)
+        self.assertEqual(manifest["schema"], "vex-artifact/v1")
+        self.assertEqual(manifest["name"], "support-bot")
+        self.assertEqual(manifest["version"], "0.3.2")
+        self.assertEqual(manifest["entry_module"], "support_bot.main")
+        self.assertEqual(manifest["policy"]["network"], "deny")
+        self.assertEqual(manifest["adapters"]["eval"], "inspect")
+        self.assertEqual(manifest["adapters"]["framework"], "pydantic-ai")
+        self.assertEqual(manifest["adapters"]["runtime"], "vex-ai-runtime")
+
+    def test_export_excludes_venv_and_pycache_by_default(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["export", "--dry-run"])
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(code, 0)
+        manifest = json.loads(output)
+        paths = [entry["path"] for entry in manifest["files"]]
+        for path in paths:
+            self.assertNotIn(".venv/", path)
+            self.assertNotIn("__pycache__", path)
+        # .env is excluded, .env.example is not.
+        self.assertNotIn(".env", paths)
+        self.assertIn(".env.example", paths)
+
+    def test_export_dry_run_writes_nothing_prints_manifest(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["export", "--dry-run", "--out", "dist/never.vex"])
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(code, 0)
+            manifest = json.loads(output)
+            self.assertEqual(manifest["schema"], "vex-artifact/v1")
+            self.assertFalse((root / "dist" / "never.vex").exists())
+            self.assertFalse((root / "dist").exists())
+
+    def test_export_respects_custom_exclude_pattern(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            secrets = root / "src" / "demo_bot" / "secrets.py"
+            secrets.write_text("TOKEN='x'\n", encoding="utf-8")
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(
+                    ["export", "--dry-run", "--exclude", "src/demo_bot/secrets.py"]
+                )
+            finally:
+                os.chdir(original_cwd)
+        self.assertEqual(code, 0)
+        manifest = json.loads(output)
+        paths = [entry["path"] for entry in manifest["files"]]
+        self.assertNotIn("src/demo_bot/secrets.py", paths)
+        self.assertIn("src/demo_bot/main.py", paths)
+
+    def test_export_hashes_match_file_contents(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            os.chdir(temp_dir)
+            try:
+                code, output = self.run_cli(["export", "--dry-run"])
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(code, 0)
+            manifest = json.loads(output)
+            import hashlib as _hashlib
+            for entry in manifest["files"]:
+                abs_path = root / entry["path"]
+                expected = _hashlib.sha256(abs_path.read_bytes()).hexdigest()
+                self.assertEqual(expected, entry["sha256"], f"hash mismatch for {entry['path']}")
+
+    def test_import_round_trip_preserves_tree(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            artifact = root / "dist" / "demo-bot-0.1.0.vex"
+            os.chdir(temp_dir)
+            try:
+                code, _ = self.run_cli(["export"])
+                self.assertEqual(code, 0)
+                self.assertTrue(artifact.exists())
+            finally:
+                os.chdir(original_cwd)
+            # Unpack to an isolated directory.
+            with tempfile.TemporaryDirectory() as dest_dir:
+                dest = Path(dest_dir) / "unpacked"
+                os.chdir(dest_dir)
+                try:
+                    code, output = self.run_cli([
+                        "import",
+                        str(artifact),
+                        "--dest",
+                        str(dest),
+                    ])
+                finally:
+                    os.chdir(original_cwd)
+                self.assertEqual(code, 0)
+                self.assertIn("Unpacked demo-bot", output)
+                # Every non-excluded file from the source made it across,
+                # with identical content.
+                for rel in [
+                    "pyproject.toml",
+                    "src/demo_bot/__init__.py",
+                    "src/demo_bot/main.py",
+                    ".env.example",
+                    ".gitignore",
+                ]:
+                    self.assertTrue((dest / rel).exists(), f"missing {rel}")
+                    self.assertEqual(
+                        (root / rel).read_bytes(),
+                        (dest / rel).read_bytes(),
+                        f"content mismatch for {rel}",
+                    )
+                # .env was excluded on export and must not be in the unpack.
+                self.assertFalse((dest / ".env").exists())
+
+    def _tamper_file_in_artifact(self, artifact: Path, file_path: str, new_bytes: bytes) -> None:
+        """Rewrite one file in the .vex tar but leave manifest.json untouched."""
+        import tarfile as _tarfile
+        with _tarfile.open(artifact, mode="r:gz") as tf:
+            members = tf.getmembers()
+            blobs: dict[str, bytes] = {}
+            for m in members:
+                if m.isfile():
+                    fp = tf.extractfile(m)
+                    blobs[m.name] = fp.read() if fp else b""
+        blobs[file_path] = new_bytes
+        # Rewrite the tarball preserving deterministic layout.
+        import io as _io
+        import gzip as _gzip
+        raw = _io.BytesIO()
+        with _gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+            with _tarfile.open(fileobj=gz, mode="w", format=_tarfile.USTAR_FORMAT) as out:
+                for name in sorted(blobs):
+                    data = blobs[name]
+                    info = _tarfile.TarInfo(name=name)
+                    info.size = len(data)
+                    info.mtime = 0
+                    info.mode = 0o644
+                    out.addfile(info, _io.BytesIO(data))
+        artifact.write_bytes(raw.getvalue())
+
+    def test_import_refuses_on_sha_mismatch(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            artifact = root / "dist" / "demo-bot-0.1.0.vex"
+            os.chdir(temp_dir)
+            try:
+                code, _ = self.run_cli(["export"])
+                self.assertEqual(code, 0)
+            finally:
+                os.chdir(original_cwd)
+            self._tamper_file_in_artifact(artifact, "src/demo_bot/main.py", b"# tampered\n")
+            with tempfile.TemporaryDirectory() as dest_dir:
+                dest = Path(dest_dir) / "unpacked"
+                code, output = self.run_cli(["import", str(artifact), "--dest", str(dest)])
+            self.assertEqual(code, 2)
+            self.assertIn("sha mismatch", output)
+            self.assertIn("src/demo_bot/main.py", output)
+
+    def test_import_force_overrides_sha_mismatch_with_warning(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            artifact = root / "dist" / "demo-bot-0.1.0.vex"
+            os.chdir(temp_dir)
+            try:
+                code, _ = self.run_cli(["export"])
+                self.assertEqual(code, 0)
+            finally:
+                os.chdir(original_cwd)
+            self._tamper_file_in_artifact(artifact, "src/demo_bot/main.py", b"# tampered\n")
+            with tempfile.TemporaryDirectory() as dest_dir:
+                dest = Path(dest_dir) / "unpacked"
+                code, output = self.run_cli([
+                    "import",
+                    str(artifact),
+                    "--dest",
+                    str(dest),
+                    "--force",
+                ])
+                self.assertEqual(code, 0)
+                self.assertIn("WARN sha mismatch", output)
+                self.assertEqual(
+                    (dest / "src/demo_bot/main.py").read_bytes(), b"# tampered\n"
+                )
+
+    def test_import_refuses_overwrite_of_non_empty_dest(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            artifact = root / "dist" / "demo-bot-0.1.0.vex"
+            os.chdir(temp_dir)
+            try:
+                code, _ = self.run_cli(["export"])
+                self.assertEqual(code, 0)
+            finally:
+                os.chdir(original_cwd)
+            with tempfile.TemporaryDirectory() as dest_dir:
+                dest = Path(dest_dir) / "existing"
+                dest.mkdir()
+                (dest / "preexisting.txt").write_text("keep me\n", encoding="utf-8")
+                code, output = self.run_cli(["import", str(artifact), "--dest", str(dest)])
+                self.assertEqual(code, 2)
+                self.assertIn("refusing to overwrite", output)
+                self.assertTrue((dest / "preexisting.txt").exists())
+                # --force allows the overwrite.
+                code, _ = self.run_cli([
+                    "import",
+                    str(artifact),
+                    "--dest",
+                    str(dest),
+                    "--force",
+                ])
+                self.assertEqual(code, 0)
+                self.assertTrue((dest / "pyproject.toml").exists())
+
+    def test_export_includes_packaged_models_in_tarball(self) -> None:
+        """Model manifests under dist/ must travel with the artifact."""
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            # Simulate a `vex package-model` output tree.
+            (root / "dist" / "classifier" / "models").mkdir(parents=True)
+            (root / "dist" / "classifier" / "models" / "classifier.onnx").write_bytes(b"fakemodel")
+            import hashlib as _hashlib
+            sha = _hashlib.sha256(b"fakemodel").hexdigest()
+            (root / "dist" / "classifier" / "vex-model.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "vex-model/v1",
+                        "schema_version": "v1",
+                        "runtime": "vex-ai-runtime",
+                        "engine": "onnxruntime",
+                        "name": "classifier",
+                        "model_path": "models/classifier.onnx",
+                        "sha256": sha,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chdir(temp_dir)
+            try:
+                code, _ = self.run_cli(["export", "--out", "/tmp/_model-test.vex"])
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(code, 0)
+            members = self._extract_tar_members(Path("/tmp/_model-test.vex"))
+            self.assertIn("dist/classifier/models/classifier.onnx", members)
+            self.assertIn("dist/classifier/vex-model.json", members)
+            # --no-include-models strips them back out.
+            os.chdir(temp_dir)
+            try:
+                code, _ = self.run_cli([
+                    "export",
+                    "--no-include-models",
+                    "--out",
+                    "/tmp/_nomodel-test.vex",
+                ])
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(code, 0)
+            members = self._extract_tar_members(Path("/tmp/_nomodel-test.vex"))
+            self.assertNotIn("dist/classifier/models/classifier.onnx", members)
+
+    def test_build_vex_artifact_manifest_includes_uv_lock(self) -> None:
+        """build_vex_artifact_manifest should expose uv.lock hash when present."""
+        from vex.cli import build_vex_artifact_manifest, collect_export_files, load_vex_policy
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_project(root)
+            (root / "uv.lock").write_text("# lockfile\n", encoding="utf-8")
+            files = collect_export_files(root, include_venv=False)
+            policy = load_vex_policy(root)
+            manifest = build_vex_artifact_manifest(root, policy, files, [])
+        self.assertIn("uv.lock", manifest["locks"])
+        self.assertTrue(manifest["locks"]["uv.lock"].startswith("sha256:"))
+
+
 if __name__ == "__main__":
     unittest.main()
