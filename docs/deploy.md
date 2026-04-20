@@ -155,4 +155,5 @@ flag will be the opt-out path.
 
 See also: [`architecture.md`](architecture.md),
 [`product-boundary.md`](product-boundary.md), [`policy.md`](policy.md),
-[`eval.md`](eval.md).
+[`eval.md`](eval.md), [`artifacts.md`](artifacts.md) (portable `.vex`
+export/import; `--from artifact.vex` on deploy is a planned follow-up).

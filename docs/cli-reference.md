@@ -401,6 +401,62 @@ Example:
 vex benchmark --runs 20 --warmup 3 --command "python -m app.bench"
 ```
 
+### `vex export`
+
+Bundle a vex-managed project into a portable `.vex` artifact (gzipped
+tarball). See [`artifacts.md`](artifacts.md) for the manifest schema and
+the determinism guarantee.
+
+Flags:
+
+- `--out <path>` — artifact destination (default
+  `dist/<name>-<version>.vex`).
+- `--include-models` / `--no-include-models` — walk `dist/*/vex-model.json`
+  and inline the referenced model files (default: include).
+- `--include-venv` / `--no-include-venv` — override the default `.venv/`
+  exclude (default: exclude).
+- `--dry-run` — print the manifest to stdout without writing a tarball.
+- `--exclude <glob>` — repeatable glob against the relative path.
+
+Exit codes:
+
+- `0` — artifact written (or dry-run printed).
+- `2` — invalid arguments.
+
+Example:
+
+```bash
+vex export --out dist/support-bot-0.3.2.vex
+```
+
+### `vex import`
+
+Unpack a `.vex` artifact into a fresh project directory, verifying every
+file's SHA-256 against the manifest.
+
+Positional:
+
+- `artifact` — path to the `.vex` file.
+
+Flags:
+
+- `--dest <path>` — destination directory (default: current dir + the
+  artifact stem).
+- `--force` — downgrade SHA mismatches to a `WARN` and allow overwriting a
+  non-empty destination.
+
+Exit codes:
+
+- `0` — artifact unpacked cleanly.
+- `2` — SHA mismatch, missing manifest, refused overwrite, or invalid
+  archive.
+
+Example:
+
+```bash
+vex import dist/support-bot-0.3.2.vex --dest /tmp/support-bot
+```
+
 ## uv passthroughs
 
 These verbs delegate directly to `uv`. They exist so the workflow stays
@@ -496,3 +552,11 @@ Example:
 ```bash
 vex tool run ruff check .
 ```
+
+## CI coverage
+
+The repo runs tests in three layers: unit (every push/PR), integration
+(every push/PR, scaffolds a real project under `uv`), and contract (labelled
+PRs / nightly, invokes real `docker` / `gcloud` / `modal` / `uvx` against
+vex-produced argv). Full end-to-end release gating lives in a separate
+sprint. See `CONTRIBUTING.md` for how to opt into each layer locally.

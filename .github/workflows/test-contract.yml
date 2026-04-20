@@ -1,0 +1,78 @@
+name: Contract Tests
+
+# Contract tests exercise vex's argv against the real external tools it
+# shells out to (docker, gcloud, modal, uvx + inspect-ai, uvx + promptfoo).
+# They are the "does the vendor CLI still accept what we emit?" layer that
+# sits between the fast unit suite and the full E2E gate (sprint 3).
+#
+# They are expensive relative to the unit/integration suites (pulling images,
+# resolving uvx tools), so they only run:
+#   - on PRs that carry the `ci:contract` label
+#   - on pushes to main
+#   - on a nightly cron (06:00 UTC)
+#
+# See CONTRIBUTING.md ("Contract tests") for local invocation.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  push:
+    branches: ["main"]
+  schedule:
+    # Nightly at 06:00 UTC.
+    - cron: "0 6 * * *"
+
+jobs:
+  contract:
+    name: Contract tests
+    # Only run on PRs when the ci:contract label is present. Always run for
+    # push-to-main and scheduled events.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'ci:contract')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.5.14"
+
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: uv-${{ runner.os }}-contract-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            uv-${{ runner.os }}-contract-
+            uv-${{ runner.os }}-
+
+      - name: Install vex + contract deps
+        run: uv sync --extra dev --group contract
+
+      - name: Install Modal client
+        run: uv pip install --system 'modal==0.65.*'
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          install_components: beta
+
+      - name: Preload sandbox image (python:3.12-slim)
+        run: docker pull python:3.12-slim
+
+      - name: Preload alpine image
+        run: docker pull alpine:3.19
+
+      - name: Run contract tests
+        env:
+          VEX_RUN_CONTRACT: "1"
+        run: uv run pytest tests/contract -m contract -v

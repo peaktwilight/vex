@@ -113,3 +113,22 @@ space is higher-level and AI-specific:
 
 The better wedge for `vex` is an AI-native workflow layer that can later
 orchestrate `vex-ai-runtime` and other execution backends.
+
+## See also
+
+- [`product-boundary.md`](product-boundary.md) — what `vex`, `uv`, and
+  `vex-ai-runtime` each own.
+- [`roadmap.md`](roadmap.md) — shipped / next / later buckets.
+- [`cli-reference.md`](cli-reference.md) — per-verb flags and exit codes.
+- [`policy.md`](policy.md) — `[tool.vex.policy]` and `vex run --sandbox`.
+- [`eval.md`](eval.md) — adapter precedence and the `vex-eval/v1` schema.
+- [`deploy.md`](deploy.md) — `deploy.targets.toml` and target adapters.
+- [`doctor.md`](doctor.md) — readiness checks.
+- [`troubleshooting.md`](troubleshooting.md) — common failure modes.
+- [`templates.md`](templates.md) — what `vex init agent` /
+  `vex init inference-api` lay down.
+- [`faq.md`](faq.md) — positioning, mechanics, compatibility.
+- [`runtime.md`](runtime.md) — `vex-ai-runtime` and the `vex-model/v1`
+  manifest contract.
+- [`release.md`](release.md) — versioning, CI gate, changelog, and
+  deprecation policy.

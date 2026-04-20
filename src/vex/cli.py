@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import fnmatch
+import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -10,6 +14,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import tomllib
@@ -28,6 +33,8 @@ COMMAND_HELP = {
     "policy": "Inspect AI execution policy configuration",
     "package-model": "Create a packaged model artifact manifest",
     "schema": "Validate Vex schema artifacts",
+    "export": "Bundle the project into a portable .vex artifact",
+    "import": "Unpack a portable .vex artifact into a project directory",
     "add": "Add dependencies and sync the environment",
     "remove": "Remove dependencies and sync the environment",
     "sync": "Make the environment match the lockfile",
@@ -3455,6 +3462,556 @@ def package_model(root: Path, model_path: Path, out_dir: Path, name: str | None,
     return manifest_path
 
 
+# ---------------------------------------------------------------------------
+# vex export / vex import — portable .vex agent artifacts
+# ---------------------------------------------------------------------------
+
+VEX_ARTIFACT_SCHEMA = "vex-artifact/v1"
+VEX_ARTIFACT_MANIFEST_NAME = "manifest.json"
+
+# Paths (directories are matched by a trailing `/` or by path prefix).
+DEFAULT_EXPORT_EXCLUDES: tuple[str, ...] = (
+    ".venv/",
+    "__pycache__/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    ".git/",
+    "dist/",
+    "artifacts/",
+    "node_modules/",
+    "*.pyc",
+    ".DS_Store",
+    ".env",
+)
+
+
+class _GitignoreMatcher:
+    """Minimal gitignore-style matcher. Stdlib-only, ~30-50 lines.
+
+    Supports line-by-line patterns from one or more `.gitignore` files
+    interpreted relative to their parent directory. Handles:
+
+    - blank lines and `#` comments (ignored)
+    - leading `!` for negation
+    - leading `/` to anchor to the gitignore's directory
+    - trailing `/` to match directories only
+    - glob metacharacters via `fnmatch` on each path segment
+
+    This is intentionally a subset of full gitignore semantics (no `**`,
+    no character classes beyond fnmatch). Good enough for the default
+    project trees we export; `--exclude` covers the long tail.
+    """
+
+    def __init__(self, root: Path):
+        self._root = root
+        # Each rule: (base_rel_posix, pattern, is_negation, dir_only, anchored)
+        self._rules: list[tuple[str, str, bool, bool, bool]] = []
+        # Seeded with the project-root .gitignore; subdir .gitignores load lazily.
+        gi = root / ".gitignore"
+        if gi.is_file():
+            self._load(gi, base_rel="")
+
+    def _load(self, path: Path, base_rel: str) -> None:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        for raw in content.splitlines():
+            line = raw.rstrip()
+            if not line or line.lstrip().startswith("#"):
+                continue
+            negation = False
+            if line.startswith("!"):
+                negation = True
+                line = line[1:]
+            anchored = False
+            if line.startswith("/"):
+                anchored = True
+                line = line[1:]
+            dir_only = False
+            if line.endswith("/"):
+                dir_only = True
+                line = line[:-1]
+            if not line:
+                continue
+            self._rules.append((base_rel, line, negation, dir_only, anchored))
+
+    def match(self, rel_posix: str, is_dir: bool) -> bool:
+        """Return True when `rel_posix` should be ignored."""
+        ignored = False
+        for base_rel, pattern, negation, dir_only, anchored in self._rules:
+            if dir_only and not is_dir:
+                continue
+            # Limit the rule's scope to its own directory.
+            if base_rel:
+                if not (rel_posix == base_rel or rel_posix.startswith(base_rel + "/")):
+                    continue
+                candidate = rel_posix[len(base_rel) + 1 :] if rel_posix != base_rel else ""
+            else:
+                candidate = rel_posix
+            if not candidate:
+                continue
+            if anchored or "/" in pattern:
+                if fnmatch.fnmatchcase(candidate, pattern):
+                    ignored = not negation
+                    continue
+                # Also match as a prefix for directory patterns like "src/foo".
+                if fnmatch.fnmatchcase(candidate, pattern + "/*"):
+                    ignored = not negation
+                    continue
+            else:
+                # Unanchored: match any segment of the path.
+                segments = candidate.split("/")
+                if any(fnmatch.fnmatchcase(seg, pattern) for seg in segments):
+                    ignored = not negation
+        return ignored
+
+
+def _match_default_exclude(rel_posix: str, is_dir: bool) -> bool:
+    segments = rel_posix.split("/")
+    for pattern in DEFAULT_EXPORT_EXCLUDES:
+        if pattern.endswith("/"):
+            name = pattern[:-1]
+            if any(seg == name for seg in segments):
+                return True
+        elif pattern == ".env":
+            # Exact match on basename, but .env.example is explicitly allowed.
+            if segments[-1] == ".env":
+                return True
+        elif "*" in pattern or "?" in pattern or "[" in pattern:
+            if any(fnmatch.fnmatchcase(seg, pattern) for seg in segments):
+                return True
+        else:
+            if segments[-1] == pattern:
+                return True
+    return False
+
+
+def _match_user_excludes(rel_posix: str, patterns: Sequence[str]) -> bool:
+    for pattern in patterns:
+        if fnmatch.fnmatchcase(rel_posix, pattern):
+            return True
+        # Also match directory prefixes: "src/*" should hit "src/foo/bar.py".
+        if fnmatch.fnmatchcase(rel_posix, pattern.rstrip("/") + "/*"):
+            return True
+    return False
+
+
+def collect_export_files(
+    root: Path,
+    *,
+    include_venv: bool,
+    extra_excludes: Sequence[str] = (),
+) -> list[Path]:
+    """Walk `root` and return included files (sorted, relative paths as `Path`)."""
+    gi = _GitignoreMatcher(root)
+    collected: list[Path] = []
+
+    def _is_excluded(rel_posix: str, is_dir: bool) -> bool:
+        if rel_posix in {".git", ".git/"}:
+            return True
+        if _match_default_exclude(rel_posix, is_dir):
+            # The --include-venv toggle lets users override the default .venv skip.
+            if include_venv and rel_posix.split("/")[0] == ".venv":
+                return False
+            return True
+        if _match_user_excludes(rel_posix, extra_excludes):
+            return True
+        if gi.match(rel_posix, is_dir):
+            return True
+        return False
+
+    # Deterministic walk: sort entries per directory.
+    stack: list[Path] = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
+            rel = entry.relative_to(root)
+            rel_posix = rel.as_posix()
+            if entry.is_symlink():
+                # Skip symlinks entirely; a reproducible tarball cannot
+                # round-trip them safely across platforms.
+                continue
+            if entry.is_dir():
+                if _is_excluded(rel_posix, True):
+                    continue
+                stack.append(entry)
+                continue
+            if entry.is_file():
+                if _is_excluded(rel_posix, False):
+                    continue
+                collected.append(rel)
+    collected.sort(key=lambda p: p.as_posix())
+    return collected
+
+
+def collect_export_model_manifests(root: Path) -> list[dict[str, Any]]:
+    """Find dist/<name>/vex-model.json files and read their summary fields."""
+    dist = root / "dist"
+    results: list[dict[str, Any]] = []
+    if not dist.is_dir():
+        return results
+    for manifest_path in sorted(dist.glob("*/vex-model.json")):
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        model_rel = data.get("model_path")
+        if not isinstance(model_rel, str):
+            continue
+        model_file = manifest_path.parent / model_rel
+        try:
+            model_rel_to_root = model_file.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            model_rel_to_root = (manifest_path.parent / model_rel).as_posix()
+        sha = data.get("sha256") if isinstance(data.get("sha256"), str) else None
+        if sha is None and model_file.is_file():
+            sha = compute_sha256(model_file)
+        entry: dict[str, Any] = {
+            "path": model_rel_to_root,
+            "sha256": sha or "",
+            "engine": str(data.get("engine", "")),
+        }
+        if "name" in data:
+            entry["name"] = str(data["name"])
+        results.append(entry)
+    return results
+
+
+def _derive_entry_module(project_name: str) -> str:
+    snake = re.sub(r"[^A-Za-z0-9]+", "_", project_name).strip("_").lower()
+    return f"{snake or 'app'}.main"
+
+
+def build_vex_artifact_manifest(
+    root: Path,
+    policy: dict[str, Any],
+    files: Sequence[Path],
+    models: Sequence[dict[str, Any]],
+    *,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Assemble the `manifest.json` dict for an exported artifact.
+
+    Pulled out so tests can exercise the manifest shape directly without
+    driving the full tarball writer.
+    """
+    pyproject = load_pyproject(root)
+    project = pyproject.get("project", {}) if isinstance(pyproject, dict) else {}
+    name = str(project.get("name", "")) or root.name
+    version = str(project.get("version", "0.0.0"))
+    python_requires = str(project.get("requires-python", ""))
+
+    tool_vex = pyproject.get("tool", {}).get("vex", {}) if isinstance(pyproject, dict) else {}
+    ai_cfg = tool_vex.get("ai", {}) if isinstance(tool_vex, dict) else {}
+    eval_cfg = tool_vex.get("eval", {}) if isinstance(tool_vex, dict) else {}
+    adapters: dict[str, str] = {}
+    if isinstance(eval_cfg, dict) and isinstance(eval_cfg.get("adapter"), str):
+        adapters["eval"] = eval_cfg["adapter"]
+    if isinstance(ai_cfg, dict):
+        for key in ("runtime", "framework", "template"):
+            value = ai_cfg.get(key)
+            if isinstance(value, str) and value:
+                adapters[key] = value
+
+    file_entries: list[dict[str, str]] = []
+    for rel in files:
+        abs_path = root / rel
+        if not abs_path.is_file():
+            continue
+        file_entries.append({
+            "path": rel.as_posix(),
+            "sha256": compute_sha256(abs_path),
+        })
+
+    locks: dict[str, str] = {}
+    lock_path = root / "uv.lock"
+    if lock_path.is_file():
+        locks["uv.lock"] = f"sha256:{compute_sha256(lock_path)}"
+
+    if created_at is None:
+        # Deterministic: use the newest mtime among included files so two
+        # consecutive exports over an unchanged tree produce byte-identical
+        # bytes. Callers (e.g. tests) can still pass an explicit override.
+        newest = 0.0
+        for rel in files:
+            abs_path = root / rel
+            try:
+                newest = max(newest, abs_path.stat().st_mtime)
+            except OSError:
+                continue
+        created_at = (
+            _dt.datetime.fromtimestamp(int(newest), tz=_dt.timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    manifest: dict[str, Any] = {
+        "schema": VEX_ARTIFACT_SCHEMA,
+        "name": name,
+        "version": version,
+        "created_at": created_at,
+        "python_requires": python_requires,
+        "entry_module": _derive_entry_module(name),
+        "policy": dict(policy),
+        "adapters": adapters,
+        "files": file_entries,
+        "models": [dict(m) for m in models],
+        "locks": locks,
+    }
+    return manifest
+
+
+def _deterministic_tarinfo(name: str, size: int, *, is_dir: bool) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name=name)
+    info.size = size
+    info.mtime = 0
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    if is_dir:
+        info.type = tarfile.DIRTYPE
+        info.mode = 0o755
+    else:
+        info.type = tarfile.REGTYPE
+        info.mode = 0o644
+    return info
+
+
+def write_vex_artifact(
+    out_path: Path,
+    root: Path,
+    manifest: dict[str, Any],
+    files: Sequence[Path],
+) -> None:
+    """Write a deterministic `.vex` tarball to `out_path`."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+    raw = io.BytesIO()
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, compresslevel=6) as gz:
+        with tarfile.open(fileobj=gz, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+            # Manifest first so `vex import` can short-circuit.
+            info = _deterministic_tarinfo(VEX_ARTIFACT_MANIFEST_NAME, len(manifest_bytes), is_dir=False)
+            tf.addfile(info, io.BytesIO(manifest_bytes))
+
+            for rel in sorted({Path(f["path"]) for f in manifest["files"]}, key=lambda p: p.as_posix()):
+                abs_path = root / rel
+                if not abs_path.is_file():
+                    continue
+                data = abs_path.read_bytes()
+                info = _deterministic_tarinfo(rel.as_posix(), len(data), is_dir=False)
+                tf.addfile(info, io.BytesIO(data))
+
+    out_path.write_bytes(raw.getvalue())
+
+
+def _default_export_out_path(root: Path, manifest: dict[str, Any]) -> Path:
+    name = manifest.get("name") or root.name or "agent"
+    version = manifest.get("version") or "0.0.0"
+    return root / "dist" / f"{name}-{version}.vex"
+
+
+def handle_export(args: argparse.Namespace) -> int:
+    root = project_root()
+    include_models: bool = getattr(args, "include_models", True)
+    include_venv: bool = getattr(args, "include_venv", False)
+    dry_run: bool = bool(getattr(args, "dry_run", False))
+    excludes = tuple(getattr(args, "exclude", []) or [])
+
+    files = collect_export_files(root, include_venv=include_venv, extra_excludes=excludes)
+    models = collect_export_model_manifests(root) if include_models else []
+
+    # `dist/` is in the default exclude list so the walk skips it, but model
+    # artifacts live under `dist/<name>/` and must travel with the bundle.
+    # Re-add them explicitly (manifest + referenced model file).
+    if models:
+        known = {p.as_posix() for p in files}
+        extras: list[Path] = []
+        for entry in models:
+            model_rel = entry.get("path")
+            if isinstance(model_rel, str):
+                model_path = root / model_rel
+                if model_path.is_file() and model_rel not in known:
+                    extras.append(Path(model_rel))
+                    known.add(model_rel)
+        # Also include every dist/<name>/vex-model.json we found.
+        for manifest_path in sorted((root / "dist").glob("*/vex-model.json")):
+            rel = manifest_path.relative_to(root).as_posix()
+            if rel not in known:
+                extras.append(Path(rel))
+                known.add(rel)
+        if extras:
+            files = sorted(list(files) + extras, key=lambda p: p.as_posix())
+
+    policy = load_vex_policy(root)
+    manifest = build_vex_artifact_manifest(root, policy, files, models)
+
+    if dry_run:
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
+
+    out_raw = getattr(args, "out", None)
+    out_path = (root / out_raw) if out_raw else _default_export_out_path(root, manifest)
+
+    write_vex_artifact(out_path, root, manifest, files)
+    rel = out_path.relative_to(root) if out_path.is_relative_to(root) else out_path
+    print(
+        f"Wrote {manifest['name']} v{manifest['version']} to {rel} "
+        f"({len(manifest['files'])} files, {len(manifest['models'])} models)"
+    )
+    return 0
+
+
+def _verify_manifest_shape(manifest: Any) -> tuple[bool, str]:
+    if not isinstance(manifest, dict):
+        return False, "manifest.json is not a JSON object"
+    if manifest.get("schema") != VEX_ARTIFACT_SCHEMA:
+        return False, f"unsupported artifact schema: {manifest.get('schema')!r}"
+    if not isinstance(manifest.get("files"), list):
+        return False, "manifest.files is not a list"
+    return True, ""
+
+
+def _destination_is_empty(dest: Path) -> bool:
+    if not dest.exists():
+        return True
+    if not dest.is_dir():
+        return False
+    try:
+        return not any(dest.iterdir())
+    except OSError:
+        return False
+
+
+def handle_import(args: argparse.Namespace) -> int:
+    artifact_raw = getattr(args, "artifact", None)
+    if not artifact_raw:
+        print("vex import requires an artifact path")
+        return 2
+    artifact_path = Path(artifact_raw)
+    if not artifact_path.is_absolute():
+        artifact_path = Path.cwd() / artifact_path
+    if not artifact_path.is_file():
+        print(f"artifact not found: {artifact_raw}")
+        return 2
+
+    dest_raw = getattr(args, "dest", None)
+    force: bool = bool(getattr(args, "force", False))
+
+    try:
+        tf = tarfile.open(artifact_path, mode="r:gz")
+    except (tarfile.TarError, OSError) as exc:
+        print(f"failed to open artifact: {exc}")
+        return 2
+
+    with tf:
+        try:
+            manifest_member = tf.getmember(VEX_ARTIFACT_MANIFEST_NAME)
+        except KeyError:
+            print("artifact is missing manifest.json")
+            return 2
+        manifest_fp = tf.extractfile(manifest_member)
+        if manifest_fp is None:
+            print("artifact manifest.json is not readable")
+            return 2
+        try:
+            manifest = json.loads(manifest_fp.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(f"manifest.json is not valid JSON: {exc}")
+            return 2
+
+        ok, message = _verify_manifest_shape(manifest)
+        if not ok:
+            print(message)
+            return 2
+
+        if dest_raw:
+            dest = Path(dest_raw)
+            if not dest.is_absolute():
+                dest = Path.cwd() / dest
+        else:
+            dest = Path.cwd() / artifact_path.stem
+
+        if not _destination_is_empty(dest) and not force:
+            print(f"refusing to overwrite non-empty destination: {dest}")
+            return 2
+
+        dest.mkdir(parents=True, exist_ok=True)
+
+        file_entries = manifest["files"]
+        sha_mismatches: list[tuple[str, str, str]] = []
+        for entry in file_entries:
+            if not isinstance(entry, dict):
+                continue
+            rel = entry.get("path")
+            expected_sha = entry.get("sha256")
+            if not isinstance(rel, str) or not isinstance(expected_sha, str):
+                continue
+            try:
+                member = tf.getmember(rel)
+            except KeyError:
+                msg = f"artifact is missing file listed in manifest: {rel}"
+                if force:
+                    print(f"WARN {msg} (--force)")
+                    continue
+                print(msg)
+                return 2
+            src = tf.extractfile(member)
+            if src is None:
+                print(f"could not read {rel} from artifact")
+                return 2
+            data = src.read()
+            actual_sha = hashlib.sha256(data).hexdigest()
+            if actual_sha != expected_sha:
+                sha_mismatches.append((rel, expected_sha, actual_sha))
+                if not force:
+                    print(
+                        f"sha mismatch for {rel}: expected {expected_sha}, got {actual_sha}"
+                    )
+                    return 2
+                print(
+                    f"WARN sha mismatch for {rel}: expected {expected_sha}, got {actual_sha} (--force)"
+                )
+            # Refuse any absolute or parent-traversal paths in the tar.
+            target = (dest / rel).resolve()
+            try:
+                target.relative_to(dest.resolve())
+            except ValueError:
+                print(f"refusing to extract path outside destination: {rel}")
+                return 2
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+
+        policy = manifest.get("policy", {}) if isinstance(manifest.get("policy"), dict) else {}
+        sandbox = bool(policy.get("sandbox", False))
+        network = str(policy.get("network", "unknown"))
+        entry_module = str(manifest.get("entry_module", "app.main"))
+        name = str(manifest.get("name", "agent"))
+        version = str(manifest.get("version", "0.0.0"))
+        try:
+            dest_display = dest.relative_to(Path.cwd())
+        except ValueError:
+            dest_display = dest
+        print(
+            f"Unpacked {name} v{version} to {dest_display}. "
+            f"policy.sandbox={str(sandbox).lower()} network={network} entry={entry_module}. "
+            f"Next: cd {dest_display} && vex doctor ai"
+        )
+        if sha_mismatches and force:
+            print(f"WARN {len(sha_mismatches)} file(s) had sha mismatches; imported with --force")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vex",
@@ -3630,6 +4187,30 @@ def build_parser() -> argparse.ArgumentParser:
     schema_validate.set_defaults(handler=handle_schema)
 
     schema_parser.set_defaults(handler=handle_schema)
+
+    export_parser = subparsers.add_parser("export", help=COMMAND_HELP["export"])
+    export_parser.add_argument("--out", default=None)
+    export_parser.add_argument(
+        "--include-models",
+        dest="include_models",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    export_parser.add_argument(
+        "--include-venv",
+        dest="include_venv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    export_parser.add_argument("--dry-run", dest="dry_run", action="store_true")
+    export_parser.add_argument("--exclude", action="append", default=[])
+    export_parser.set_defaults(handler=handle_export)
+
+    import_parser = subparsers.add_parser("import", help=COMMAND_HELP["import"])
+    import_parser.add_argument("artifact")
+    import_parser.add_argument("--dest", default=None)
+    import_parser.add_argument("--force", action="store_true")
+    import_parser.set_defaults(handler=handle_import)
 
     add_parser = subparsers.add_parser("add", help=COMMAND_HELP["add"])
     add_parser.add_argument("packages", nargs="+")

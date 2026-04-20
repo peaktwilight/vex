@@ -59,6 +59,32 @@ gated behind the `integration` marker plus the `VEX_RUN_INTEGRATION=1`
 environment variable to avoid surprising contributors with a multi-minute
 scaffold+sync during a quick unit loop.
 
+### Contract tests
+
+Contract tests verify that the argv `vex` emits is still accepted by the
+real external tools it shells out to: `docker`, `gcloud`, `modal`, `uvx` +
+`inspect-ai`, `uvx` + `promptfoo`. They are opt-in:
+
+```bash
+VEX_RUN_CONTRACT=1 uv run pytest tests/contract -m contract
+# or, if you already have pytest in your env:
+VEX_RUN_CONTRACT=1 pytest tests/contract -m contract
+```
+
+System dependencies required locally:
+
+- `docker` (or compatible) on `PATH`, with `python:3.12-slim` pullable
+- `gcloud` CLI on `PATH` (no auth / project required — the test uses
+  `--dry-run` with a dummy project)
+- `uvx` on `PATH` (ships with `uv`)
+- `modal` Python client is installed only inside the CI workflow; the local
+  contract suite never imports it because the Modal test uses `ast.parse`
+  to avoid triggering a login check.
+
+CI runs the contract suite on PRs that carry the `ci:contract` label, on
+push-to-main, and on a nightly `06:00 UTC` schedule. See
+`.github/workflows/test-contract.yml`.
+
 ## Architecture Boundary
 
 Keep this separation clear:
