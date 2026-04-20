@@ -250,6 +250,9 @@ dev = [
 ]
 
 [package.dev-dependencies]
+contract = [
+    { name = "pytest" },
+]
 test = [
     { name = "pytest" },
 ]
@@ -262,4 +265,5 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+contract = [{ name = "pytest", specifier = ">=8.0" }]
 test = [{ name = "pytest", specifier = ">=8.0" }]
