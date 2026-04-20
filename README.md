@@ -37,7 +37,7 @@ LangGraph CLI ships `langgraph new → langgraph dev → langgraph deploy`. Moda
 
 ```bash
 vex init agent support-bot   # scaffolds a PydanticAI agent under a default policy
-vex dev                      # watchfiles reload + provider banner + ollama fallback
+vex dev                      # watchfiles reload + provider banner + JSONL trace tail
 vex eval                     # PASS/FAIL over your dataset, CI-ready exit codes
 vex deploy modal             # ships it (preflight runs automatically)
 ```
@@ -100,7 +100,7 @@ Eval / deploy / doctor / init:
 - `vex doctor ai` — readiness report (uv, pyproject, policy, provider env, ollama reachability, eval dataset shape, deploy profile env vars)
 - `vex init agent <path> [--framework pydantic-ai|langgraph|claude-agent-sdk]` — scaffolds a real agent with `agent.py` (or `graph.py` for LangGraph) + one tool, `settings.py` with provider auto-resolution (openai / anthropic / ollama), `main.py` async entrypoint, `eval.py` with PASS/FAIL reporting, five seed eval cases, `prompts/system.md`, `.env.example`, `deploy.targets.toml` with `default` and `prod` profiles. Default framework: `pydantic-ai`
 - `vex init inference-api <path>` — FastAPI + uvicorn + typed schemas
-- `vex dev` — watchfiles reload + provider banner, with `--no-reload` / `--watch` / `--provider-check` flags
+- `vex dev` — watchfiles reload + provider banner + inline `[trace]` tail of an OTel-GenAI-shaped JSONL under `artifacts/traces/latest.jsonl` (see [`docs/tracing.md`](docs/tracing.md)), with `--no-reload` / `--watch` / `--provider-check` / `--no-trace` flags
 - `vex benchmark --command ... --runs ... --warmup ...` — harness with warmup control and JSON output
 - `vex package-model <model.onnx>` — versioned manifest with compatibility metadata:
   ```json
@@ -129,7 +129,6 @@ No API key? `vex` falls back to a local [`ollama`](https://ollama.com) model —
 
 The policy contract keeps getting sharper:
 
-- Trace tail in `vex dev` — inline LLM / tool-call trace view during the reload loop
 - Inspect AI adapter as the default eval backend (see [issue #23](https://github.com/peaktwilight/vex/issues/23))
 - Logfire + OTel GenAI observability hook on scaffolded agents (see [issue #24](https://github.com/peaktwilight/vex/issues/24))
 
