@@ -1,0 +1,26 @@
+# Minimal promptfoo config pointing at the stdlib fake provider in
+# fake_provider.py. Wired up but NOT exercised by the current contract
+# suite — kept here for sprint 3 when we want a real promptfoo invocation
+# against a deterministic backend.
+#
+# Launch the server first:
+#   python tests/contract/fixtures/fake_provider.py --port 18080
+# then:
+#   VEX_RUN_CONTRACT=1 uv run pytest tests/contract -m contract
+
+description: "contract-test fake provider"
+
+providers:
+  - id: openai:chat:fake-provider/contract
+    config:
+      apiKey: contract-test-key
+      apiBaseUrl: http://127.0.0.1:18080/v1
+
+prompts:
+  - "Respond with 'ok'."
+
+tests:
+  - vars: {}
+    assert:
+      - type: contains
+        value: contract-fake-response
