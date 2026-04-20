@@ -57,6 +57,7 @@ One CLI. One `pyproject.toml`. No yaml sprawl. `vex` rides on top of `uv` and co
   vex ──┼── uv ──────────── install, lock, sync, python versions, build, publish
         ├── vex-ai-runtime ─ native model load, schema validation, policy enforcement
         ├── ollama ───────── local fallback when no API key
+        ├── agent ────────── pydantic-ai | langgraph | claude-agent-sdk (vex init agent --framework)
         ├── promptfoo ────── eval adapter (when promptfooconfig.yaml exists)
         └── deploy ───────── docker | cloud-run | modal
 ```
@@ -97,7 +98,7 @@ Eval / deploy / doctor / init:
 - `vex deploy docker|cloud-run|modal [--apply|--run] [--policy-gate]` — scaffold + ship end-to-end; `docker --run` builds and runs locally, `cloud-run --apply` runs `gcloud builds submit` then `gcloud run deploy` and echoes the service URL, `modal --run` invokes `modal deploy` and surfaces the `*.modal.run` URL. Profile inheritance (`inherit = "default"`), env interpolation (`${VEX_IMAGE_REPO}`), and Cloud Run profile fields (`project`, `memory`, `cpu`, `min_instances`, `max_instances`, `service_account`, `allow_unauthenticated`). `--policy-gate` (opt-in) hard-fails on permissive policy and translates `[tool.vex.policy]` into target-native primitives — see [`docs/deploy.md`](docs/deploy.md). Preflight runs automatically on `--apply`/`--run` (override with `--skip-preflight`)
 - `vex deploy check [--for all|docker|cloud-run|modal]` — preflight
 - `vex doctor ai` — readiness report (uv, pyproject, policy, provider env, ollama reachability, eval dataset shape, deploy profile env vars)
-- `vex init agent <path>` — scaffolds a real PydanticAI agent: `agent.py` with a tool, `settings.py` with provider auto-resolution (openai / anthropic / ollama), `main.py` async entrypoint, `eval.py` with PASS/FAIL reporting, five seed eval cases, `prompts/system.md`, `.env.example`, `deploy.targets.toml` with `default` and `prod` profiles
+- `vex init agent <path> [--framework pydantic-ai|langgraph|claude-agent-sdk]` — scaffolds a real agent with `agent.py` (or `graph.py` for LangGraph) + one tool, `settings.py` with provider auto-resolution (openai / anthropic / ollama), `main.py` async entrypoint, `eval.py` with PASS/FAIL reporting, five seed eval cases, `prompts/system.md`, `.env.example`, `deploy.targets.toml` with `default` and `prod` profiles. Default framework: `pydantic-ai`
 - `vex init inference-api <path>` — FastAPI + uvicorn + typed schemas
 - `vex dev` — watchfiles reload + provider banner, with `--no-reload` / `--watch` / `--provider-check` flags
 - `vex benchmark --command ... --runs ... --warmup ...` — harness with warmup control and JSON output

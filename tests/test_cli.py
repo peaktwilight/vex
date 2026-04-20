@@ -462,6 +462,175 @@ class CliTests(unittest.TestCase):
         self.assertIn('requires-python = ">=3.11"', pyproject)
         self.assertEqual(python_version, "3.12")
 
+    def test_init_agent_default_framework_is_pydantic_ai(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(["init", "agent", "default-fw"])
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "default-fw"
+            pkg = root / "src" / "default_fw"
+            pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+            has_agent_py = (pkg / "agent.py").exists()
+            has_graph_py = (pkg / "graph.py").exists()
+
+        self.assertEqual(code, 0)
+        self.assertIn('framework = "pydantic-ai"', pyproject)
+        self.assertIn('"pydantic-ai>=0.0.0"', pyproject)
+        self.assertTrue(has_agent_py)
+        self.assertFalse(has_graph_py)
+
+    def test_init_agent_langgraph_writes_graph_py(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["init", "agent", "lg-agent", "--framework", "langgraph"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "lg-agent"
+            pkg = root / "src" / "lg_agent"
+            has_graph_py = (pkg / "graph.py").exists()
+            graph_src = (pkg / "graph.py").read_text(encoding="utf-8") if has_graph_py else ""
+            has_agent_py = (pkg / "agent.py").exists()
+
+        self.assertEqual(code, 0)
+        self.assertTrue(has_graph_py)
+        self.assertFalse(has_agent_py)
+        self.assertIn("StateGraph", graph_src)
+        self.assertIn("ToolNode", graph_src)
+        self.assertIn("lookup_faq", graph_src)
+
+    def test_init_agent_langgraph_sets_framework_config(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["init", "agent", "lg-config", "--framework", "langgraph"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "lg-config"
+            pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertIn('framework = "langgraph"', pyproject)
+        self.assertIn('"langgraph>=0.2"', pyproject)
+
+    def test_init_agent_langgraph_pyproject_has_langchain_deps(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["init", "agent", "lg-deps", "--framework", "langgraph"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "lg-deps"
+            pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertIn('"langchain-openai>=0.2"', pyproject)
+        self.assertIn('"langchain-anthropic>=0.2"', pyproject)
+        self.assertNotIn("pydantic-ai", pyproject)
+
+    def test_init_agent_claude_sdk_writes_agent_py(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["init", "agent", "claude-sdk", "--framework", "claude-agent-sdk"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "claude-sdk"
+            pkg = root / "src" / "claude_sdk"
+            has_agent_py = (pkg / "agent.py").exists()
+            has_graph_py = (pkg / "graph.py").exists()
+            agent_src = (pkg / "agent.py").read_text(encoding="utf-8") if has_agent_py else ""
+
+        self.assertEqual(code, 0)
+        self.assertTrue(has_agent_py)
+        self.assertFalse(has_graph_py)
+        self.assertIn("from claude_agent_sdk import", agent_src)
+        self.assertIn("ClaudeAgent", agent_src)
+        self.assertIn("lookup_faq", agent_src)
+
+    def test_init_agent_claude_sdk_pyproject_has_claude_dep(self) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.chdir(temp_dir)
+            try:
+                code, _output = self.run_cli(
+                    ["init", "agent", "claude-dep", "--framework", "claude-agent-sdk"]
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            root = Path(temp_dir) / "claude-dep"
+            pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+
+        self.assertEqual(code, 0)
+        self.assertIn('framework = "claude-agent-sdk"', pyproject)
+        self.assertIn('"claude-agent-sdk>=0.1.60"', pyproject)
+        self.assertNotIn("pydantic-ai", pyproject)
+        self.assertNotIn("langgraph", pyproject)
+
+    def test_init_agent_all_frameworks_generate_valid_python(self) -> None:
+        import ast
+
+        original_cwd = os.getcwd()
+        cases = [
+            ("pydantic-ai", "fw-pa", "fw_pa"),
+            ("langgraph", "fw-lg", "fw_lg"),
+            ("claude-agent-sdk", "fw-cs", "fw_cs"),
+        ]
+        for framework, dir_name, pkg_name in cases:
+            with self.subTest(framework=framework):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    os.chdir(temp_dir)
+                    try:
+                        code, _output = self.run_cli(
+                            ["init", "agent", dir_name, "--framework", framework]
+                        )
+                    finally:
+                        os.chdir(original_cwd)
+
+                    root = Path(temp_dir) / dir_name
+                    pkg = root / "src" / pkg_name
+                    py_sources: list[tuple[str, str]] = []
+                    for py_file in sorted(pkg.glob("*.py")):
+                        py_sources.append((str(py_file), py_file.read_text(encoding="utf-8")))
+                    run_eval_path = root / "evals" / "run_eval.py"
+                    py_sources.append(
+                        (str(run_eval_path), run_eval_path.read_text(encoding="utf-8"))
+                    )
+
+                    self.assertEqual(code, 0)
+                    # must have generated at least the package files plus run_eval
+                    self.assertGreaterEqual(len(py_sources), 4)
+                    for name, source in py_sources:
+                        ast.parse(source)  # raises if invalid
+
+    def test_init_agent_rejects_framework_without_agent_template(self) -> None:
+        code, output = self.run_cli(
+            ["init", "inference-api", "bad-combo", "--framework", "langgraph"]
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("--framework is only valid with", output)
+
     def test_init_inference_api_creates_template_files(self) -> None:
         original_cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -560,6 +729,37 @@ class CliTests(unittest.TestCase):
         self.assertIn("WARN missing AI workflow script 'dev'", output)
         self.assertIn("WARN missing AI workflow script 'eval'", output)
         self.assertIn("WARN missing [tool.vex.policy] configuration", output)
+
+    @patch("vex.cli.uv_bin", return_value="/usr/local/bin/uv")
+    def test_doctor_ai_reports_framework_in_config(self, _uv_bin: object) -> None:
+        original_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text(
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\n"
+                "[tool.vex]\nmanaged = true\n\n"
+                "[tool.vex.env]\npath = \".venv\"\n\n"
+                "[tool.vex.scripts]\n"
+                'dev = "python -m demo.main"\n'
+                'eval = "python evals/run_eval.py --input {input}"\n'
+                'test = "pytest"\n\n'
+                "[tool.vex.policy]\n"
+                "sandbox = true\n"
+                'network = "deny"\n\n'
+                "[tool.vex.ai]\n"
+                'template = "agent"\n'
+                'framework = "langgraph"\n',
+                encoding="utf-8",
+            )
+            (root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+            (root / ".venv").mkdir()
+            os.chdir(temp_dir)
+            try:
+                _code, output = self.run_cli(["doctor", "ai"])
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("OK  framework: langgraph", output)
 
     @patch.dict(os.environ, {"OPENAI_API_KEY": "sk-testkey"}, clear=False)
     @patch("vex.cli.sandbox_image_cached", return_value=True)

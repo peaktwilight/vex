@@ -32,6 +32,11 @@ Flags:
 - `--python <str>` — Python version forwarded to `uv init --python`. When
   omitted, the scaffold pins to `3.12` and normalizes `requires-python` to
   `>=3.11` so projects stay portable across developer machines.
+- `--framework {pydantic-ai,langgraph,claude-agent-sdk}` — only valid with
+  `vex init agent`. Selects the agent framework baked into the scaffolded
+  files and `[project.optional-dependencies].agent`. Default: `pydantic-ai`.
+  The chosen framework is recorded as `[tool.vex.ai].framework` and surfaced
+  by `vex doctor ai`.
 - `--app` — passthrough to `uv init --app --no-package` (non-packaged app).
 - `--lib` — passthrough to `uv init --lib --package --build-backend hatch`.
   Mutually exclusive with `--app`.
@@ -54,6 +59,8 @@ Example:
 
 ```bash
 vex init agent support-bot --name support-bot
+vex init agent graph-bot --framework langgraph
+vex init agent claude-bot --framework claude-agent-sdk
 ```
 
 ### `vex dev`
