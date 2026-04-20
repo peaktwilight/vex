@@ -489,3 +489,11 @@ Example:
 ```bash
 vex tool run ruff check .
 ```
+
+## CI coverage
+
+The repo runs tests in three layers: unit (every push/PR), integration
+(every push/PR, scaffolds a real project under `uv`), and contract (labelled
+PRs / nightly, invokes real `docker` / `gcloud` / `modal` / `uvx` against
+vex-produced argv). Full end-to-end release gating lives in a separate
+sprint. See `CONTRIBUTING.md` for how to opt into each layer locally.
