@@ -3695,7 +3695,8 @@ def collect_export_model_manifests(root: Path) -> list[dict[str, Any]]:
         try:
             model_rel_to_root = model_file.resolve().relative_to(root.resolve()).as_posix()
         except (OSError, ValueError):
-            model_rel_to_root = (manifest_path.parent / model_rel).as_posix()
+            # Do not package model files that resolve outside the project.
+            continue
         sha = data.get("sha256") if isinstance(data.get("sha256"), str) else None
         if sha is None and model_file.is_file():
             sha = compute_sha256(model_file)
