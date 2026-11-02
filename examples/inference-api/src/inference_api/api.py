@@ -14,7 +14,48 @@ from .schemas import (
     PredictResponse,
 )
 
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
+class _RequestBodyLimitMiddleware:
+    """Bound request memory and JSON parsing before FastAPI reads the body."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        received = 0
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > 64 * 1024:
+                    raise _RequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _RequestBodyTooLarge:
+            await send({
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [(b"content-type", b"application/json")],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b'{"detail":"request body too large"}',
+            })
+
+
 app = FastAPI(title="vex inference api", version="0.1.0")
+app.add_middleware(_RequestBodyLimitMiddleware)
 
 
 @app.get("/healthz", response_model=HealthResponse)
